@@ -1,0 +1,48 @@
+services:
+  base:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.onyx-base
+    image: ghcr.io/aenoriss/onyx-base:latest
+
+  ingest:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.onyx-ingest
+    image: ghcr.io/aenoriss/onyx-ingest:latest
+    depends_on: [base]
+
+  instantsfm:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.onyx-instantsfm
+    image: ghcr.io/aenoriss/onyx-instantsfm:latest
+    depends_on: [base]
+
+  milo:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.onyx-milo
+    image: ghcr.io/aenoriss/onyx-milo:latest
+    depends_on: [base]
+
+  gsplat:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.onyx-gsplat
+    image: ghcr.io/aenoriss/onyx-gsplat:latest
+    depends_on: [base]
+
+  openmvs:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.onyx-openmvs
+    image: ghcr.io/aenoriss/onyx-openmvs:latest
+    depends_on: [base]
+
+  segformer:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.onyx-segformer
+    image: ghcr.io/aenoriss/onyx-segformer:latest
+    depends_on: [base]

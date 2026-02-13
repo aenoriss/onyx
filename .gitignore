@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+
+# Data / models (large files)
+scenes/
+*.mp4
+*.ply
+*.pth
+*.ckpt
+*.safetensors
+
+# Pipeline working directories
+workdir/
+pipeline_state.json
+.progress.json
+
+# Node
+node_modules/
+
+# Docker
+.dockerignore
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Serena / Claude
+.serena/
+.claude/

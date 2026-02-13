@@ -1,0 +1,28 @@
+# onyx-gsplat: gsplat/splatfacto — Gaussian Splatting Training
+# Build with: docker build -f build/Dockerfile.onyx-gsplat -t onyx-gsplat:latest .
+# (build context = repo root)
+# Output: Standard PLY format (compatible with Unreal, web viewers, etc.)
+
+FROM ghcr.io/aenoriss/onyx-base:latest
+
+# gsplat CUDA kernels (torch, CUDA arch list from base)
+RUN pip install --no-cache-dir gsplat==1.4.0
+
+# Pre-compile gsplat CUDA kernels at build time (avoids ~5-10 min JIT on first run)
+# nvcc runs on CPU — no GPU needed. Compiles for all arches in TORCH_CUDA_ARCH_LIST.
+ENV TORCH_EXTENSIONS_DIR=/opt/torch_extensions
+RUN python -c "from gsplat.cuda._backend import _C; print('gsplat CUDA kernels compiled:', _C)"
+
+# Nerfstudio (has its own COLMAP parser, no pycolmap needed)
+RUN pip install --no-cache-dir nerfstudio
+
+# Copy training wrapper
+COPY tools/gsplat/train.py /workspace/train.py
+
+# Disable torch inductor JIT compilation (avoids ~10 min cold start per container)
+# Falls back to pre-compiled CUDA kernels (gsplat, PyTorch). ~10-20% slower per iteration
+# but eliminates architecture-specific compilation and serverless cold start penalty.
+# Remove this to re-enable inductor if using persistent cache volumes.
+ENV TORCHDYNAMO_DISABLE=1
+
+ENTRYPOINT ["python", "/workspace/train.py"]

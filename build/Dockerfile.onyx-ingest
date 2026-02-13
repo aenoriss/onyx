@@ -1,0 +1,29 @@
+# onyx-ingest: 360 Extractor + Standard Video Extractor
+# Build with: docker build -f build/Dockerfile.onyx-ingest -t onyx-ingest:latest .
+# (build context = repo root)
+
+FROM ghcr.io/aenoriss/onyx-base:latest
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ffmpeg for video decoding + telemetry extraction
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    # EGL/OpenGL for PySide6 (Qt) headless support
+    libegl1 \
+    libopengl0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ingest-specific Python deps (torch, opencv, numpy, tqdm already in base)
+RUN pip install --no-cache-dir \
+    ultralytics>=8.0.0 \
+    piexif>=1.1.3 \
+    PySide6>=6.5.0
+
+# Copy 360Extractor source
+COPY tools/360Extractor /workspace/360Extractor
+
+# Ingest wrapper with progress tracking
+COPY tools/ingest/wrapper.py /workspace/wrapper.py
+
+ENTRYPOINT ["python", "/workspace/wrapper.py"]

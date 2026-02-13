@@ -1,0 +1,79 @@
+# onyx-milo: MILo Mesh-In-the-Loop Gaussian Splatting
+# Build with: docker build -f build/Dockerfile.onyx-milo -t onyx-milo:latest .
+# (build context = repo root)
+# Output: High-quality triangulated mesh (.ply)
+#
+# NOTE: Migrated from CUDA 11.8 + conda + PyTorch 2.3.1 to shared onyx-base
+# (CUDA 12.6 + pip + PyTorch 2.5.1). May need testing.
+
+FROM ghcr.io/aenoriss/onyx-base:latest
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# EGL for nvdiffrast + tetra_triangulation build deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libxrender-dev \
+    # EGL for nvdiffrast headless rendering
+    libegl1-mesa-dev \
+    libgles2-mesa-dev \
+    libglvnd-dev \
+    # tetra_triangulation deps (replaces conda-forge::gmp and conda-forge::cgal)
+    libgmp-dev \
+    libcgal-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone MILo (fix SSH URLs for Docker builds)
+WORKDIR /workspace
+RUN git clone https://github.com/Anttwo/MILo.git && \
+    cd MILo && \
+    sed -i 's|git@github.com:|https://github.com/|g' .gitmodules && \
+    git submodule sync && \
+    git submodule update --init --recursive
+
+WORKDIR /workspace/MILo
+
+# Patch for Docker/headless: use CUDA context instead of OpenGL
+RUN sed -i 's/use_opengl=True/use_opengl=False/g' milo/scene/mesh.py
+
+# Patch for CUDA 12.6 compatibility: add missing #include <cfloat> for FLT_MAX
+RUN sed -i '1i #include <cfloat>' submodules/simple-knn/simple_knn.cu
+
+# Install Python requirements
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install submodules (--no-build-isolation to use installed torch)
+RUN pip install --no-build-isolation submodules/diff-gaussian-rasterization_ms
+RUN pip install --no-build-isolation submodules/diff-gaussian-rasterization
+RUN pip install --no-build-isolation submodules/diff-gaussian-rasterization_gof
+RUN pip install --no-build-isolation submodules/simple-knn
+RUN pip install --no-build-isolation submodules/fused-ssim
+
+# CUDA paths for tetra_triangulation (needs cuda_runtime.h)
+ENV CUDA_HOME=/usr/local/cuda
+ENV CPATH=/usr/local/cuda/targets/x86_64-linux/include:${CPATH}
+
+# Tetra-triangulation build (cmake from base, gmp+cgal from apt above)
+WORKDIR /workspace/MILo/submodules/tetra_triangulation
+RUN cmake . -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+RUN make
+RUN pip install --no-build-isolation .
+# Copy the compiled C++ extension to site-packages (setup.py has CMake build commented out)
+RUN cp tetranerf/utils/extension/tetranerf_cpp_extension.cpython-*.so \
+    /usr/local/lib/python3.10/dist-packages/tetranerf/utils/extension/
+
+# Nvdiffrast (--no-build-isolation for torch)
+WORKDIR /workspace/MILo/submodules/nvdiffrast
+RUN pip install --no-build-isolation .
+
+WORKDIR /workspace/MILo
+
+# Copy training wrapper script
+COPY tools/milo/train_wrapper.py /workspace/train_wrapper.py
+
+# NVIDIA container capabilities (graphics needed for nvdiffrast rendering)
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+ENV NVIDIA_VISIBLE_DEVICES=all
+
+WORKDIR /workspace
+
+ENTRYPOINT ["python", "/workspace/train_wrapper.py"]

@@ -1,0 +1,66 @@
+# onyx-openmvs: OpenMVS with CUDA — dense reconstruction & mesh generation
+# Build with: docker build -f build/Dockerfile.onyx-openmvs -t onyx-openmvs:latest .
+# (build context = repo root)
+
+FROM ghcr.io/aenoriss/onyx-base:latest
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# OpenMVS build dependencies (base provides build-essential, cmake, ninja, git, eigen via base)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Boost components
+    libboost-iostreams-dev \
+    libboost-program-options-dev \
+    libboost-system-dev \
+    libboost-serialization-dev \
+    # Core libraries
+    libopencv-dev \
+    libcgal-dev \
+    libeigen3-dev \
+    # Image formats
+    libpng-dev \
+    libjpeg-dev \
+    libtiff-dev \
+    # Graphics
+    libglu1-mesa-dev \
+    libglfw3-dev \
+    libglew-dev \
+    # Ceres (pre-built from apt for OpenMVS)
+    libceres-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install nanoflann from source (cmake config not in Ubuntu package)
+WORKDIR /opt
+RUN git clone --depth 1 https://github.com/jlblancoc/nanoflann.git && \
+    cd nanoflann && mkdir build && cd build && \
+    cmake .. -DNANOFLANN_BUILD_EXAMPLES=OFF -DNANOFLANN_BUILD_TESTS=OFF && \
+    make install
+
+# Clone VCGLib (header-only library)
+RUN git clone --depth 1 https://github.com/cnr-isti-vclab/vcglib.git
+ENV VCG_ROOT=/opt/vcglib
+
+# Clone OpenMVS v2.3.0 (stable release)
+RUN git clone --branch v2.3.0 --depth 1 https://github.com/cdcseacave/openMVS.git
+
+# Build OpenMVS with CUDA
+WORKDIR /opt/openMVS/build
+RUN cmake .. \
+    -GNinja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DOpenMVS_USE_CUDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" \
+    -DOpenMVS_BUILD_TOOLS=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DCUDA_CUDA_LIBRARY=/usr/local/cuda/lib64/stubs/libcuda.so \
+    && ninja -j$(nproc) \
+    && ninja install
+
+ENV PATH="/usr/local/bin/OpenMVS:${PATH}"
+
+# OpenMVS wrapper with progress tracking
+COPY tools/openmvs/wrapper.py /workspace/wrapper.py
+
+WORKDIR /data
+
+ENTRYPOINT ["python", "/workspace/wrapper.py"]
