@@ -251,48 +251,6 @@ docker compose build milo && docker compose push milo
 
 ---
 
-## Scaling Path
-
-### Phase 1: Single Machine (Current)
-
-One GPU server, `run_pipeline.py` orchestrates Docker containers locally. Works on any Linux machine with Docker + NVIDIA drivers — local workstation, cloud VPS, RunPod GPU Pod, Vast.ai.
-
-### Phase 2: Multiple GPU Servers (10-20 concurrent users)
-
-2-3 GPU servers, each with Docker + pre-pulled images. A Redis + Celery job queue distributes work. `run_pipeline.py` runs unmodified on whichever server picks the job.
-
-```
-Web API (Railway/Vercel, no GPU)
-    |
-    v
-Redis job queue
-    |-- GPU Server 1 (runs run_pipeline.py per job)
-    |-- GPU Server 2
-    +-- GPU Server 3
-```
-
-### Phase 3: Kubernetes (100+ concurrent users)
-
-Argo Workflows on a managed Kubernetes cluster (AWS EKS, GCP GKE). Each pipeline step becomes a Kubernetes Job. Containers run unmodified — Argo replaces `run_pipeline.py` as the orchestrator.
-
-**Key principle:** The containers never change between phases. Only the orchestration layer swaps out.
-
----
-
-## Platform Compatibility
-
-| Platform | Compatible? | Notes |
-|---|---|---|
-| **Local workstation** | Yes | Full Docker + GPU access |
-| **RunPod GPU Pods** | Yes | Full VM with Docker. Script runs unmodified. |
-| **Vast.ai** | Yes | Full VM with Docker. Script runs unmodified. |
-| **AWS EC2 (g5/p4)** | Yes | Full VM with Docker. |
-| **Hetzner GPU** | Yes | Full VM with Docker. |
-| **Railway / Vercel / Heroku** | No | PaaS — no Docker daemon access, no GPUs |
-| **RunPod Serverless** | No | Runs one container per request, no Docker-in-Docker |
-
----
-
 ## Progress Tracking
 
 ### Two-File System
