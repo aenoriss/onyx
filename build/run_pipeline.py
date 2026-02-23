@@ -91,10 +91,30 @@ ALL_CONTAINERS = [
 # ─── Helpers ──────────────────────────────────────────────────
 
 def uid_gid_flags():
-    """Return --user UID:GID flags for Docker."""
-    uid = os.getuid()
-    gid = os.getgid()
-    return ["--user", f"{uid}:{gid}"]
+    """Return --user UID:GID flags for Docker (Linux/macOS only).
+
+    On Windows, Docker Desktop runs containers as the current user automatically,
+    so no --user flag is needed.
+    """
+    if sys.platform == "win32":
+        return []
+    return ["--user", f"{os.getuid()}:{os.getgid()}"]
+
+
+def docker_path(host_path):
+    """Convert a host path to a Docker-compatible mount path.
+
+    On Windows, Docker Desktop (WSL2 backend) expects paths like /c/Users/...
+    instead of C:\\Users\\...
+    """
+    p = Path(host_path).resolve()
+    if sys.platform == "win32":
+        # Convert C:\foo\bar  →  /c/foo/bar
+        drive, rest = os.path.splitdrive(str(p))
+        drive_letter = drive.rstrip(":").lower()
+        rest_posix = rest.replace("\\", "/")
+        return f"/{drive_letter}{rest_posix}"
+    return str(p)
 
 
 def image_name(local, container):
@@ -616,7 +636,7 @@ def step_ingest(config, state, output_dir, dry_run=False):
     cmd = [
         "docker", "run", "--rm",
         *uid_gid_flags(),
-        "-v", f"{Path(output_dir).resolve()}:/data",
+        "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), container),
         "--input", "/data/input_video.mp4",
         "--output", "/data/images",
@@ -653,7 +673,7 @@ def step_sfm(config, state, output_dir, dry_run=False):
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
         "-e", "HOME=/tmp",
-        "-v", f"{Path(output_dir).resolve()}:/data",
+        "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), container),
         "--data_path", "/data",
     ]
@@ -683,7 +703,7 @@ def _run_milo(config, state, output_dir, dry_run):
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
         "-e", "HOME=/tmp",
-        "-v", f"{Path(output_dir).resolve()}:/data",
+        "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), "onyx-milo"),
         "--scene", "/data",
         "--metric", scene,
@@ -703,7 +723,7 @@ def _run_gsplat(config, state, output_dir, dry_run):
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
         "-e", "HOME=/tmp",
-        "-v", f"{Path(output_dir).resolve()}:/data",
+        "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), "onyx-gsplat"),
         "--scene", "/data",
         "--iterations", "7000",
@@ -717,7 +737,7 @@ def _run_openmvs(config, state, output_dir, dry_run):
     quality = config["quality"]
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
-        "-v", f"{Path(output_dir).resolve()}:/data",
+        "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), "onyx-openmvs"),
         "--data_path", "/data",
     ]
@@ -743,7 +763,7 @@ def step_segformer(config, state, output_dir, dry_run=False):
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
         "-e", "HOME=/tmp",
-        "-v", f"{Path(output_dir).resolve()}:/data",
+        "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), container),
         "--input", "/data/images",
         "--output", "/data/masks",
