@@ -56,6 +56,34 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+_WINDOWS = sys.platform == "win32"
+
+
+def _setup_windows_console():
+    """Enable ANSI escape codes and UTF-8 output on Windows.
+
+    Without this:
+    - ANSI codes (\033[2K etc.) print as literal garbage in CMD/PowerShell
+    - Unicode characters (━ █ ░) raise UnicodeEncodeError on CP1252 consoles
+    """
+    if not _WINDOWS:
+        return
+    # Reconfigure stdout/stderr to UTF-8 (replaces unencodable chars instead of crashing)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # Enable VT100 virtual terminal processing via Windows API
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        for handle_id in (-10, -11, -12):  # stdin, stdout, stderr
+            handle = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_ulong()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass  # Non-fatal: ANSI codes may not render but script will still run
+
+
 # ─── Constants ────────────────────────────────────────────────
 
 GHCR_REGISTRY = "ghcr.io/aenoriss"
@@ -1344,6 +1372,7 @@ def parse_args():
 
 
 def main():
+    _setup_windows_console()
     args = parse_args()
 
     # Handle SIGINT gracefully
@@ -1443,10 +1472,14 @@ def main():
 
         video_dst = output_dir / "input_video.mp4"
         if not video_dst.exists():
-            try:
-                os.symlink(input_path, video_dst)
-            except OSError:
+            if _WINDOWS:
+                # Symlinks require admin/Developer Mode on Windows — copy instead
                 shutil.copy2(str(input_path), str(video_dst))
+            else:
+                try:
+                    os.symlink(input_path, video_dst)
+                except OSError:
+                    shutil.copy2(str(input_path), str(video_dst))
 
         print(f"Starting pipeline [{state.run_id}]")
         video_label = config.get('video', 'auto')
