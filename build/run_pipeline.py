@@ -311,7 +311,7 @@ class PipelineState:
         if not path.exists():
             print(f"Error: No pipeline state found at {path}")
             sys.exit(1)
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         return cls(path, data)
 
@@ -345,7 +345,7 @@ class PipelineState:
         """Atomic write (tmp + rename). Recomputes state hash."""
         self.data["state_hash"] = self._compute_state_hash()
         tmp = str(self.path) + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2)
         os.replace(tmp, str(self.path))
 
@@ -490,7 +490,7 @@ class ProgressDashboard:
     def _read_progress(self):
         try:
             if self.progress_file.exists():
-                with open(self.progress_file) as f:
+                with open(self.progress_file, encoding="utf-8") as f:
                     return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
@@ -593,11 +593,13 @@ def run_docker(cmd, step_name, state, output_dir, dry_run=False):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
 
     last_lines = []
-    with open(log_file, "w") as lf:
+    with open(log_file, "w", encoding="utf-8") as lf:
         for line in proc.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -615,7 +617,7 @@ def run_docker(cmd, step_name, state, output_dir, dry_run=False):
         progress_file = Path(output_dir) / ".progress.json"
         try:
             if progress_file.exists():
-                with open(progress_file) as f:
+                with open(progress_file, encoding="utf-8") as f:
                     pdata = json.load(f)
                 substep_info = {
                     "substep": pdata.get("stage"),
@@ -681,7 +683,7 @@ def step_ingest(config, state, output_dir, dry_run=False):
     # Read back detected video type from container
     video_type_file = Path(output_dir) / ".video_type"
     if video_type_file.exists():
-        detected = video_type_file.read_text().strip()
+        detected = video_type_file.read_text(encoding="utf-8").strip()
         if detected in ("360", "normal"):
             state.data["base_config"]["video"] = detected
             state.save()
@@ -815,6 +817,18 @@ def step_segformer(config, state, output_dir, dry_run=False):
 
 # ─── Purge ────────────────────────────────────────────────────
 
+def _rmtree(path):
+    """shutil.rmtree wrapper that handles read-only files on Windows."""
+    if _WINDOWS:
+        import stat
+        def _remove_readonly(func, fpath, _):
+            os.chmod(fpath, stat.S_IWRITE)
+            func(fpath)
+        shutil.rmtree(path, onerror=_remove_readonly)
+    else:
+        shutil.rmtree(path)
+
+
 def do_purge(workdir, keep_output=False):
     """Delete working directory data."""
     workdir = Path(workdir).resolve()
@@ -836,13 +850,13 @@ def do_purge(workdir, keep_output=False):
             if item.name == "output":
                 continue
             if item.is_dir():
-                shutil.rmtree(item)
+                _rmtree(item)
             else:
                 item.unlink()
         print(f"[DONE] Purged {run_id} — output/ preserved")
     else:
         print(f"Purging {workdir}...")
-        shutil.rmtree(workdir)
+        _rmtree(workdir)
         print(f"[DONE] Purged {run_id} — all data deleted")
 
 
@@ -866,7 +880,7 @@ def do_purge_all(scan_dir, keep_output=False):
     print(f"Found {len(batches)} batch(es) to purge:")
     for b in batches:
         try:
-            with open(b / "pipeline_state.json") as f:
+            with open(b / "pipeline_state.json", encoding="utf-8") as f:
                 data = json.load(f)
             print(f"  {data.get('id', '?'):<28s} {b.name}")
         except Exception:
@@ -881,7 +895,7 @@ def do_purge_all(scan_dir, keep_output=False):
 
     for b in batches:
         try:
-            with open(b / "pipeline_state.json") as f:
+            with open(b / "pipeline_state.json", encoding="utf-8") as f:
                 run_id = json.load(f).get("id", "?")
         except Exception:
             run_id = "?"
@@ -1022,7 +1036,7 @@ def do_list(scan_dir):
 
     for workdir, sf in batches:
         try:
-            with open(sf) as f:
+            with open(sf, encoding="utf-8") as f:
                 data = json.load(f)
             run_id = data.get("id", "?")
             state_hash = data.get("state_hash", "?")
@@ -1188,7 +1202,7 @@ def do_import(zip_path, output_dir=None):
         # Check for existing batch at target
         existing_state = output_dir / "pipeline_state.json"
         if existing_state.exists():
-            with open(existing_state) as ef:
+            with open(existing_state, encoding="utf-8") as ef:
                 existing = json.load(ef)
             existing_id = existing.get("id", "unknown")
             existing_hash = existing.get("state_hash", "unknown")
