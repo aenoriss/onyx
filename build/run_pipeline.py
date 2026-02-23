@@ -164,7 +164,7 @@ def check_docker():
     try:
         result = subprocess.run(
             ["docker", "version", "--format", "{{.Server.Version}}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
         if result.returncode != 0:
             return False, "Docker daemon not running"
@@ -219,7 +219,7 @@ def do_install(local=False):
         print(f"  [{i}/{total}] {container:<24s} pulling...", end="", flush=True)
         result = subprocess.run(
             ["docker", "pull", img],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
             print(f"\r  [{i}/{total}] {container:<24s} done")
