@@ -335,7 +335,7 @@ class PipelineState:
                     "quality": r["quality"],
                     "steps": {
                         s: r["steps"][s].get("status", "pending")
-                        for s in RUN_STEPS
+                        for s in r["steps"]
                     },
                 }
                 for r in self.data.get("runs", [])
