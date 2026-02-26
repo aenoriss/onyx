@@ -1004,7 +1004,7 @@ def do_fork(source_dir, mode, quality, dry_run=False):
                 state.set_active_run(i)
                 # Reset failed steps
                 for s in RUN_STEPS:
-                    if run["steps"][s]["status"] in ("failed", "running"):
+                    if s in run["steps"] and run["steps"][s]["status"] in ("failed", "running"):
                         run["steps"][s] = {"status": "pending"}
                 state.save()
                 break
@@ -1026,6 +1026,8 @@ def do_fork(source_dir, mode, quality, dry_run=False):
 
     # Run per-run steps
     for step in RUN_STEPS:
+        if step not in state.active_run["steps"]:
+            continue
         status = state.step_status(step)
         if status == "completed":
             elapsed = state.step_info(step).get("elapsed", 0)
