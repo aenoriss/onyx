@@ -95,13 +95,16 @@ ALL_STEPS = SHARED_STEPS + RUN_STEPS
 TARGET_IMAGES = {
     ("outdoor", "production"): 300,
     ("outdoor", "proto"):      150,
+    ("outdoor", "yono"):       150,
     ("indoor",  "production"): 150,
     ("indoor",  "proto"):      100,
+    ("indoor",  "yono"):       100,
 }
 
 RECONSTRUCTION_CONTAINER = {
     ("gaussian", "production"):       "onyx-milo",
     ("gaussian", "proto"):            "onyx-gsplat",
+    ("gaussian", "yono"):             "onyx-yonosplat",
     ("photogrammetry", "production"): "onyx-openmvs",
     ("photogrammetry", "proto"):      "onyx-openmvs",
 }
@@ -111,6 +114,7 @@ ALL_CONTAINERS = [
     "onyx-instantsfm",
     "onyx-milo",
     "onyx-gsplat",
+    "onyx-yonosplat",
     "onyx-openmvs",
     "onyx-segformer",
 ]
@@ -288,7 +292,12 @@ class PipelineState:
             },
             "started_at": datetime.now().isoformat(),
             "shared_steps": {
-                step: {"status": "pending"} for step in SHARED_STEPS
+                step: (
+                    {"status": "skipped", "reason": "pose-free quality level"}
+                    if step == "SFM" and config.get("quality") == "yono"
+                    else {"status": "pending"}
+                )
+                for step in SHARED_STEPS
             },
             "runs": [
                 {
@@ -781,6 +790,8 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
         _run_milo(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "proto":
         _run_gsplat(config, state, output_dir, dry_run)
+    elif mode == "gaussian" and quality == "yono":
+        _run_yonosplat(config, state, output_dir, dry_run)
     elif mode == "photogrammetry":
         _run_openmvs(config, state, output_dir, dry_run)
 
@@ -797,9 +808,10 @@ def _run_milo(config, state, output_dir, dry_run):
         "--metric", scene,
         "--rasterizer", "radegs",
         "--extract-mesh",
+        # indoor: verylowres reduces SDF mesh complexity during training,
+        # which avoids nvdiffrast CUDA error 700 on some GPUs/drivers
+        *(["--mesh_config", "verylowres"] if scene == "indoor" else []),
     ]
-    # --dense removed for indoor: causes 1.7M+ Gaussians which crashes
-    # nvdiffrast mesh regularization (CUDA error 700) on lower-VRAM GPUs
 
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
@@ -835,6 +847,22 @@ def _run_openmvs(config, state, output_dir, dry_run):
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
 
+def _run_yonosplat(config, state, output_dir, dry_run):
+    """Run YonoSplat pose-free feed-forward Gaussian Splatting (no SFM input needed)."""
+    cmd = [
+        "docker", "run", "--rm", "--gpus", "all",
+        *uid_gid_flags(),
+        "-e", "HOME=/tmp",
+        "-v", f"{docker_path(output_dir)}:/data",
+        image_name(config.get("local", False), "onyx-yonosplat"),
+        "--scene",      "/data/images",
+        "--output",     "/data/output/yonosplat",
+        "--scene-type", config["scene"],
+        "--quality",    config["quality"],
+    ]
+    run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
+
+
 def step_segformer(config, state, output_dir, dry_run=False):
     """Step 4: Segformer masking + optional Gaussian filtering."""
     container = "onyx-segformer"
@@ -856,6 +884,8 @@ def step_segformer(config, state, output_dir, dry_run=False):
     if mode == "gaussian":
         if quality == "production":
             ply = "/data/output/milo/point_cloud/iteration_18000/point_cloud.ply"
+        elif quality == "yono":
+            ply = "/data/output/yonosplat/splat.ply"
         else:
             ply = "/data/output/splatfacto/ply/splat.ply"
         cmd.extend([
@@ -1383,8 +1413,8 @@ def parse_args():
                         help="Reconstruction mode")
     parser.add_argument("--scene", choices=["indoor", "outdoor"],
                         help="Scene type")
-    parser.add_argument("--quality", choices=["proto", "production"],
-                        help="Quality level")
+    parser.add_argument("--quality", choices=["proto", "production", "yono"],
+                        help="Quality level (yono = pose-free feed-forward, no SFM)")
     parser.add_argument("--video", choices=["normal", "360", "auto"],
                         default="auto",
                         help="Video type (default: auto-detect)")
