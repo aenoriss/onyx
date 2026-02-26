@@ -284,6 +284,7 @@ class PipelineState:
                 "scene": config["scene"],
                 "video": config["video"],
                 "input": config["input"],
+                "segment": config.get("segment", False),
             },
             "started_at": datetime.now().isoformat(),
             "shared_steps": {
@@ -295,7 +296,9 @@ class PipelineState:
                     "quality": config["quality"],
                     "started_at": datetime.now().isoformat(),
                     "steps": {
-                        step: {"status": "pending"} for step in RUN_STEPS
+                        step: {"status": "pending"}
+                        for step in RUN_STEPS
+                        if step != "SEGFORMER" or config.get("segment", False)
                     },
                 }
             ],
@@ -429,10 +432,19 @@ class PipelineState:
         }
         self.save()
 
+    @property
+    def all_steps(self):
+        """Return ordered steps for this run — only includes steps present in state."""
+        result = list(SHARED_STEPS)
+        for s in RUN_STEPS:
+            if s in self.active_run["steps"]:
+                result.append(s)
+        return result
+
     def reset_from(self, step):
         """Reset this step and all subsequent steps to pending."""
         found = False
-        for s in ALL_STEPS:
+        for s in self.all_steps:
             if s == step:
                 found = True
             if found:
@@ -441,11 +453,16 @@ class PipelineState:
 
     def add_run(self, mode, quality):
         """Append a new run and make it active."""
+        segment = self.data["base_config"].get("segment", False)
         run = {
             "mode": mode,
             "quality": quality,
             "started_at": datetime.now().isoformat(),
-            "steps": {step: {"status": "pending"} for step in RUN_STEPS},
+            "steps": {
+                step: {"status": "pending"}
+                for step in RUN_STEPS
+                if step != "SEGFORMER" or segment
+            },
         }
         self.data["runs"].append(run)
         self._active_run_idx = len(self.data["runs"]) - 1
@@ -511,7 +528,7 @@ class ProgressDashboard:
 
         live = self._read_progress()
 
-        for step in ALL_STEPS:
+        for step in self.state.all_steps:
             status = self.state.step_status(step)
             info = self.state.step_info(step)
 
@@ -543,7 +560,8 @@ class ProgressDashboard:
                         if det:
                             detail += f"  {det}"
                     else:
-                        detail = f"  {stage}{step_info} ..."
+                        # Indeterminate: show stage name only, no progress bar
+                        detail = f"  {stage}{step_info}"
                         if det:
                             detail += f"  {det}"
 
@@ -694,10 +712,50 @@ def step_ingest(config, state, output_dir, dry_run=False):
         state.save()
 
 
+def _ensure_images_flat(output_dir):
+    """Flatten *_processed/ subdirs in images/ before SFM runs.
+
+    The 360Extractor writes to {images}/{video}_processed/ instead of {images}/
+    directly. InstantSfM expects images directly in images/. This handles cases
+    where the ingest container already completed (and its flatten ran), but also
+    guards against resumed runs where INGEST was skipped and old structure remains.
+    """
+    images_dir = Path(output_dir) / "images"
+    if not images_dir.exists():
+        return
+
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+    direct = [f for f in images_dir.iterdir()
+              if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
+    if direct:
+        return  # Already flat — nothing to do
+
+    processed = [d for d in images_dir.iterdir()
+                 if d.is_dir() and d.name.endswith("_processed")]
+    if not processed:
+        return
+
+    print(f"[PREFLIGHT] Flattening _processed/ subdirectory in images/...")
+    for subdir in processed:
+        for f in subdir.iterdir():
+            shutil.move(str(f), str(images_dir / f.name))
+        try:
+            subdir.rmdir()
+        except OSError:
+            pass
+    moved = len([f for f in images_dir.iterdir()
+                 if f.is_file() and f.suffix.lower() in IMAGE_EXTS])
+    print(f"[PREFLIGHT] {moved} images ready in images/")
+
+
 def step_sfm(config, state, output_dir, dry_run=False):
     """Step 2: Structure from Motion."""
     container = "onyx-instantsfm"
     state.start_step("SFM", container)
+
+    # Guard: flatten _processed/ subdir if ingest left old structure
+    if not dry_run:
+        _ensure_images_flat(output_dir)
 
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
@@ -779,13 +837,6 @@ def _run_openmvs(config, state, output_dir, dry_run):
 
 def step_segformer(config, state, output_dir, dry_run=False):
     """Step 4: Segformer masking + optional Gaussian filtering."""
-    scene = config["scene"]
-
-    if scene == "indoor":
-        state.skip_step("SEGFORMER", "indoor")
-        print("[SKIP] SEGFORMER — indoor scene (no sky/water masking needed)")
-        return
-
     container = "onyx-segformer"
     state.start_step("SEGFORMER", container)
 
@@ -1379,8 +1430,10 @@ def parse_args():
                         help="Skip ingest (use existing images/)")
     parser.add_argument("--skip-sfm", action="store_true",
                         help="Skip SfM (use existing sparse/)")
-    parser.add_argument("--skip-segformer", action="store_true",
-                        help="Skip segformer post-processing")
+
+    # Opt-in steps
+    parser.add_argument("--segment", action="store_true",
+                        help="Run Segformer masking after reconstruction")
 
     return parser.parse_args()
 
@@ -1478,6 +1531,7 @@ def main():
             "video": args.video,
             "input": str(input_path),
             "local": args.local,
+            "segment": args.segment,
         }
         if args.interval:
             config["interval_override"] = args.interval
@@ -1508,9 +1562,6 @@ def main():
     if args.skip_sfm:
         if state.step_status("SFM") != "completed":
             state.skip_step("SFM", "user requested --skip-sfm")
-    if args.skip_segformer:
-        if state.step_status("SEGFORMER") != "completed":
-            state.skip_step("SEGFORMER", "user requested --skip-segformer")
 
     # ── Pre-run: verify Docker images installed ────────────────
     if not args.dry_run:
@@ -1531,7 +1582,7 @@ def main():
         "SEGFORMER": step_segformer,
     }
 
-    for step in ALL_STEPS:
+    for step in state.all_steps:
         status = state.step_status(step)
 
         if status == "completed":

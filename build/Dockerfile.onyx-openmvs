@@ -59,6 +59,7 @@ RUN cmake .. \
 ENV PATH="/usr/local/bin/OpenMVS:${PATH}"
 
 # OpenMVS wrapper with progress tracking
+ARG CACHE_BUST=1
 COPY tools/openmvs/wrapper.py /workspace/wrapper.py
 
 WORKDIR /data

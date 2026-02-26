@@ -49,7 +49,7 @@ def progress(stage, status="running", pct=None, detail="",
             "t": time.time(),
         }
         tmp = PROGRESS_FILE + ".tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
         os.replace(tmp, PROGRESS_FILE)
     except Exception:
@@ -84,6 +84,8 @@ def run_with_progress(cmd, stage, step=None, total_steps=None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         cwd=cwd,
     )

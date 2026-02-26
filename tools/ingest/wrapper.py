@@ -24,6 +24,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -31,6 +32,38 @@ from pipeline_progress import progress, run_with_progress
 
 EXTRACTOR_SCRIPT = "/workspace/360Extractor/src/main.py"
 CAMERAS_PER_FRAME_360 = 12
+
+
+def flatten_processed_subdir(output_dir):
+    """Move images from {output_dir}/*_processed/ into {output_dir}/ directly.
+
+    The 360Extractor always creates a {video_name}_processed/ subfolder instead of
+    writing directly to the requested output directory. InstantSfM (ins-feat) expects
+    images directly in the images/ directory, so we flatten the structure after extraction.
+    """
+    try:
+        entries = os.listdir(output_dir)
+    except OSError:
+        return
+
+    processed_dirs = [
+        e for e in entries
+        if e.endswith("_processed") and os.path.isdir(os.path.join(output_dir, e))
+    ]
+    if not processed_dirs:
+        return
+
+    for subdir_name in processed_dirs:
+        src = os.path.join(output_dir, subdir_name)
+        moved = 0
+        for fname in os.listdir(src):
+            shutil.move(os.path.join(src, fname), os.path.join(output_dir, fname))
+            moved += 1
+        try:
+            os.rmdir(src)
+        except OSError:
+            pass
+        print(f"[INFO] Flattened {subdir_name}/ → images/ ({moved} files)")
 
 
 def get_video_duration(path):
@@ -162,7 +195,7 @@ def main():
     # Write detected type for orchestrator to read back
     detection_file = os.path.join(os.path.dirname(args.output), ".video_type")
     try:
-        with open(detection_file, "w") as f:
+        with open(detection_file, "w", encoding="utf-8") as f:
             f.write("360" if is_360 else "normal")
     except Exception:
         pass
@@ -227,6 +260,11 @@ def main():
 
     run_with_progress(cmd, "extracting_frames",
                       step=1, total_steps=1, patterns=patterns)
+
+    # The 360Extractor creates a {video_name}_processed/ subfolder inside the output
+    # directory rather than writing images directly to it. Flatten it so that
+    # InstantSfM (ins-feat) can find the images with a non-recursive os.listdir.
+    flatten_processed_subdir(args.output)
 
     progress("done", "completed", 100, step=1, total_steps=1)
 

@@ -68,6 +68,7 @@ RUN pip install --no-build-isolation .
 WORKDIR /workspace/MILo
 
 # Copy training wrapper script
+ARG CACHE_BUST=1
 COPY tools/milo/train_wrapper.py /workspace/train_wrapper.py
 
 # NVIDIA container capabilities (graphics needed for nvdiffrast rendering)

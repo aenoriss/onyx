@@ -246,8 +246,16 @@ def main():
                 "--checkpoint-output", str(filtered_ckpt),
             ])
 
+        # gaussian_mask_filter.py uses tqdm for projection + color validation
+        filter_patterns = {
+            r"(\d+)%\|": lambda m: (
+                int(m.group(1)),
+                f"Filtering {m.group(1)}%",
+            ),
+        }
         run_with_progress(filter_cmd, "gaussian_filtering",
-                          step=2, total_steps=total_steps)
+                          step=2, total_steps=total_steps,
+                          patterns=filter_patterns)
 
     progress("done", "completed", 100, step=total_steps, total_steps=total_steps)
 

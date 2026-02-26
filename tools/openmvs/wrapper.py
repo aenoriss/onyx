@@ -86,6 +86,7 @@ def main():
     ws = setup_workspace(data_path)
 
     # ── Step 1: InterfaceCOLMAP ───────────────────────────────
+    # Fast (<30s) — no patterns, indeterminate is fine
     run_with_progress(
         ["InterfaceCOLMAP",
          "--input-file", str(ws),
@@ -96,12 +97,25 @@ def main():
     )
 
     # ── Step 2: DensifyPointCloud ─────────────────────────────
+    # Longest step (30min–2hr). OpenMVS outputs lines like:
+    #   "Estimating depth-map for image N/M..." or "depth-map N/M estimated"
+    densify_patterns = {
+        r"(?i)depth.{1,50}?(\d+)/(\d+)": lambda m: (
+            round(int(m.group(1)) / int(m.group(2)) * 100),
+            f"Depth {m.group(1)}/{m.group(2)}",
+        ),
+        r"\b(\d+)%(?!\|)": lambda m: (
+            int(m.group(1)),
+            f"{m.group(1)}%",
+        ),
+    }
     run_with_progress(
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
          "--output-file", str(ws / "scene_dense.mvs")],
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
+        patterns=densify_patterns,
     )
 
     # ── Step 3: ReconstructMesh ───────────────────────────────
@@ -113,14 +127,35 @@ def main():
     if args.decimate:
         mesh_cmd.extend(["--decimate", str(args.decimate)])
 
+    reconstruct_patterns = {
+        r"\b(\d+)%(?!\|)": lambda m: (
+            int(m.group(1)),
+            f"{m.group(1)}%",
+        ),
+        r"(?i)(?:view|face|vertex).{1,30}?(\d+)/(\d+)": lambda m: (
+            round(int(m.group(1)) / int(m.group(2)) * 100),
+            f"Mesh {m.group(1)}/{m.group(2)}",
+        ),
+    }
     run_with_progress(
         mesh_cmd,
         stage="reconstruct_mesh",
         step=3, total_steps=TOTAL_STEPS,
+        patterns=reconstruct_patterns,
     )
 
     # ── Step 4: TextureMesh ───────────────────────────────────
     # Note: --export-type obj segfaults on v2.3.0, use default MVS+PLY
+    texture_patterns = {
+        r"(?i)(?:view|patch|atlas).{1,30}?(\d+)/(\d+)": lambda m: (
+            round(int(m.group(1)) / int(m.group(2)) * 100),
+            f"Texture {m.group(1)}/{m.group(2)}",
+        ),
+        r"\b(\d+)%(?!\|)": lambda m: (
+            int(m.group(1)),
+            f"{m.group(1)}%",
+        ),
+    }
     run_with_progress(
         ["TextureMesh",
          "--input-file", str(ws / "scene_dense.mvs"),
@@ -128,6 +163,7 @@ def main():
          "--output-file", str(ws / "scene_textured.mvs")],
         stage="texture_mesh",
         step=4, total_steps=TOTAL_STEPS,
+        patterns=texture_patterns,
     )
 
     # ── Copy results to shared volume ─────────────────────────

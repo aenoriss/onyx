@@ -146,9 +146,20 @@ def main():
         if args.eval:
             extract_cmd.append("--eval")
 
+        # mesh_extract_sdf.py may output tqdm bars or iteration counts
+        mesh_extract_patterns = {
+            r"(\d+)%\|": lambda m: (
+                int(m.group(1)),
+                f"Mesh extraction {m.group(1)}%",
+            ),
+            r"(?i)iter(?:ation)?\s+(\d+)/(\d+)": lambda m: (
+                round(int(m.group(1)) / int(m.group(2)) * 100),
+                f"Iter {m.group(1)}/{m.group(2)}",
+            ),
+        }
         run_with_progress(extract_cmd, "mesh_extraction",
                           step=2, total_steps=total_steps,
-                          cwd=MILO_DIR)
+                          patterns=mesh_extract_patterns, cwd=MILO_DIR)
 
         mesh_path = output_path / "mesh_learnable_sdf.ply"
         if mesh_path.exists():

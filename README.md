@@ -42,7 +42,8 @@ Options:
   --interval    Override frame extraction interval (seconds)
   --local       Use local Docker images instead of ghcr.io
   --dry-run     Print commands without executing
-  --skip-ingest / --skip-sfm / --skip-segformer
+  --segment     Run Segformer masking after reconstruction (opt-in)
+  --skip-ingest / --skip-sfm
 ```
 
 ## Containers
