@@ -798,8 +798,8 @@ def _run_milo(config, state, output_dir, dry_run):
         "--rasterizer", "radegs",
         "--extract-mesh",
     ]
-    if scene == "indoor":
-        cmd.append("--dense")
+    # --dense removed for indoor: causes 1.7M+ Gaussians which crashes
+    # nvdiffrast mesh regularization (CUDA error 700) on lower-VRAM GPUs
 
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
