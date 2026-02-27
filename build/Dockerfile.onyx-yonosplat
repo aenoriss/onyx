@@ -1,0 +1,86 @@
+# onyx-yonosplat: YonoSplat — pose-free feed-forward Gaussian Splatting
+# Build with: docker build -f build/Dockerfile.onyx-yonosplat -t onyx-yonosplat:latest .
+# (build context = repo root)
+# Output: Standard 3DGS PLY — no SFM, no per-scene optimization required
+#
+# YonoSplat: https://github.com/cvg/YonoSplat (arXiv 2511.07321, ETH Zurich + Microsoft)
+# Feed-forward, pose-free, 100 views in ~2.7 s. Used as Pipeline B baseline.
+#
+# NOTE: Uses PyTorch 2.3.1+cu118 (CUDA forward-compatible: cu118 wheels run on CUDA 12.x).
+# Overrides the base image's PyTorch 2.5.1. Minimum 2.3.x required because
+# torch.nn.attention.SDPBackend (used by YonoSplat attention layers) was added in 2.3.0.
+
+FROM ghcr.io/aenoriss/onyx-base:latest
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Clone YoNoSplat (note capital N — matches GitHub repo name)
+RUN git clone https://github.com/cvg/YoNoSplat /workspace/YonoSplat
+
+# Install YoNoSplat Python requirements (excluding CUDA extensions).
+# Requirements may pull a newer torch — we re-pin below before compiling extensions.
+RUN grep -v 'diff-gaussian-rasterization-w-pose' /workspace/YonoSplat/requirements.txt \
+    | pip install --no-cache-dir -r /dev/stdin
+
+# Re-pin PyTorch to 2.3.1+cu118 BEFORE compiling any CUDA extensions.
+# Must come after requirements (which may upgrade torch) and before any .so builds
+# to ensure all extensions link against the correct libtorch ABI.
+# cu118 wheels are CUDA forward-compatible — run on CUDA 12.x drivers unchanged.
+# 2.3.x minimum required: torch.nn.attention.SDPBackend (used by YonoSplat's attention
+# layers) was introduced in 2.3.0; 2.2.x and below do not have it.
+RUN pip install --no-cache-dir --force-reinstall \
+    torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 \
+    --index-url https://download.pytorch.org/whl/cu118
+
+# numpy 2.x broke the torch.from_numpy() bridge in torch 2.1/2.2.
+# Pin to the last 1.x release to restore compatibility.
+RUN pip install --no-cache-dir "numpy<2.0"
+
+# Patch torch's cpp_extension.py to suppress the CUDA version mismatch check.
+# cu118 wheels are forward-compatible with CUDA 12.x at runtime, but the build-time
+# check hard-errors when system nvcc (12.6) != torch's compiled CUDA (11.8).
+RUN python -c "\
+import torch.utils.cpp_extension as ext, inspect, re; \
+src = inspect.getfile(ext); \
+code = open(src).read(); \
+code = re.sub(r'raise RuntimeError\(CUDA_MISMATCH_MESSAGE\.format\([^)]+\)\)', \
+              'pass  # suppressed: cu118 is forward-compatible with CUDA 12.x', code); \
+open(src, 'w').write(code); \
+print('Patched cpp_extension.py: CUDA version check suppressed')"
+
+# CUDA extensions — compiled AFTER torch re-pin so they link against torch 2.3.1 ABI.
+# diff-gaussian-rasterization-w-pose: needs --no-build-isolation to see installed torch.
+RUN pip install --no-build-isolation \
+    git+https://github.com/rmurai0610/diff-gaussian-rasterization-w-pose.git
+
+# gsplat: used by decoder_splatting_gsplat.py, not listed in requirements.txt.
+RUN pip install --no-cache-dir gsplat
+
+# huggingface_hub for weight download (may already be pulled by requirements above)
+RUN pip install --no-cache-dir huggingface_hub
+
+# Download pretrained weights from HuggingFace
+# Repo: botaoye/YoNoSplat
+# dl3dv_224x224_ctx2to32.ckpt  — outdoor/large scenes (DL3DV)
+# re10k_224x224_ctx2to32.ckpt  — indoor scenes (RealEstate10K)
+RUN python -c "\
+from huggingface_hub import hf_hub_download; \
+import shutil, os; \
+os.makedirs('/workspace/pretrained_weights', exist_ok=True); \
+files = [('dl3dv_224x224_ctx2to32.ckpt', 'dl3dv.ckpt'), \
+         ('re10k_224x224_ctx2to32.ckpt',  're10k.ckpt')]; \
+[shutil.copy( \
+    hf_hub_download(repo_id='botaoye/YoNoSplat', filename=src, cache_dir='/tmp/hf_cache'), \
+    f'/workspace/pretrained_weights/{dst}') \
+ for src, dst in files]" && \
+    rm -rf /tmp/hf_cache
+
+# Copy inference wrapper (no CUDA extension compilation needed — YoNoSplat uses PyTorch built-ins)
+COPY tools/yonosplat/train_wrapper.py /workspace/train_wrapper.py
+
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV NVIDIA_VISIBLE_DEVICES=all
+
+WORKDIR /workspace
+
+ENTRYPOINT ["python", "/workspace/train_wrapper.py"]

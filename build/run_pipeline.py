@@ -690,12 +690,19 @@ def step_ingest(config, state, output_dir, dry_run=False):
         (config["scene"], config["quality"]), 300
     )
 
+    # Resolve the real video path. input_video.mp4 in output_dir is an absolute
+    # symlink that breaks inside the container (target path not in mount ns).
+    # Mount the actual file at a separate /video/ path to avoid colliding with
+    # the existing symlink already present under /data.
+    real_video = Path(config["input"]).resolve()
+
     cmd = [
         "docker", "run", "--rm",
         *uid_gid_flags(),
         "-v", f"{docker_path(output_dir)}:/data",
+        "-v", f"{docker_path(real_video)}:/video/input.mp4:ro",
         image_name(config.get("local", False), container),
-        "--input", "/data/input_video.mp4",
+        "--input", "/video/input.mp4",
         "--output", "/data/images",
         "--target-images", str(target),
         "--video-type", config.get("video", "auto"),
@@ -853,6 +860,7 @@ def _run_yonosplat(config, state, output_dir, dry_run):
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
         "-e", "HOME=/tmp",
+        "-e", "USER=onyx",  # getpass.getuser() needs USER when uid has no /etc/passwd entry
         "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), "onyx-yonosplat"),
         "--scene",      "/data/images",

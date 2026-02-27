@@ -67,17 +67,30 @@ def flatten_processed_subdir(output_dir):
 
 
 def get_video_duration(path):
-    """Get video duration in seconds using ffprobe."""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries",
-             "format=duration", "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=10,
-        )
-        return float(result.stdout.strip())
-    except Exception as e:
-        print(f"[WARN] ffprobe duration failed: {e}")
-        return None
+    """Get video duration in seconds using ffprobe.
+
+    Tries format-level duration first (fast), then stream-level fallback.
+    Some cameras (DJI, GoPro) store duration only in stream tags, not the
+    format header, causing format=duration to return an empty string.
+    """
+    probe_attempts = [
+        # Standard: duration in format container header
+        ["-show_entries", "format=duration", "-of", "csv=p=0"],
+        # Fallback: duration on the first video stream
+        ["-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "csv=p=0"],
+    ]
+    for probe_args in probe_attempts:
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet"] + probe_args + [path],
+                capture_output=True, text=True, timeout=10,
+            )
+            val = result.stdout.strip().split("\n")[0].strip()
+            if val and val not in ("N/A", ""):
+                return float(val)
+        except Exception as e:
+            print(f"[WARN] ffprobe duration failed: {e}")
+    return None
 
 
 def get_video_dimensions(path):

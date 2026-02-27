@@ -40,6 +40,13 @@ services:
     image: ghcr.io/aenoriss/onyx-openmvs:latest
     depends_on: [base]
 
+  yonosplat:
+    build:
+      context: .
+      dockerfile: build/Dockerfile.onyx-yonosplat
+    image: ghcr.io/aenoriss/onyx-yonosplat:latest
+    depends_on: [base]
+
   segformer:
     build:
       context: .
