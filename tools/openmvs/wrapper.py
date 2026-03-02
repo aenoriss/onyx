@@ -109,7 +109,8 @@ def main():
     run_with_progress(
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
-         "--output-file", str(ws / "scene_dense.mvs")],
+         "--output-file", str(ws / "scene_dense.mvs"),
+         "--verbosity", "1"],  # fix: default verbosity=2 has logging buffer overflow bug in v2.3.0 (fixed in develop, not stable)
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
