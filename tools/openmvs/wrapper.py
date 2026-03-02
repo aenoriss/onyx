@@ -110,7 +110,7 @@ def main():
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
          "--output-file", str(ws / "scene_dense.mvs"),
-         "--min-views-filter", "1"],  # allow images with few neighbors (e.g. 360 up/down crops)
+         "--number-views-fuse", "2"],  # default 3; relax for 360 up/down crops with few consistent views
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
