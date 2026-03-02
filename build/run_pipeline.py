@@ -1440,8 +1440,8 @@ def parse_args():
                         help="Reconstruction mode")
     parser.add_argument("--scene", choices=["indoor", "outdoor"],
                         help="Scene type")
-    parser.add_argument("--quality", choices=["proto", "production", "yono"],
-                        help="Quality level (yono = pose-free feed-forward, no SFM)")
+    parser.add_argument("--quality", choices=["proto", "production", "yono", "dense"],
+                        help="Quality level (dense = OpenMVS densify → MILo init; yono = pose-free feed-forward, no SFM)")
     parser.add_argument("--video", choices=["normal", "360", "auto"],
                         default="auto",
                         help="Video type (default: auto-detect)")
