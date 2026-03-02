@@ -23,7 +23,8 @@ from pathlib import Path
 
 from pipeline_progress import progress, run_with_progress
 
-TOTAL_STEPS = 4
+TOTAL_STEPS_FULL = 4
+TOTAL_STEPS_DENSIFY = 2
 WORKSPACE = "/tmp/mvs_workspace"
 
 
@@ -60,6 +61,8 @@ def main():
                         help="Mesh decimation factor (e.g. 0.2 for proto)")
     parser.add_argument("--output", default=None,
                         help="Output directory (default: data_path/output/openmvs)")
+    parser.add_argument("--densify-only", action="store_true",
+                        help="Only run InterfaceCOLMAP + DensifyPointCloud (skip mesh steps)")
     args = parser.parse_args()
 
     data_path = Path(args.data_path).resolve()
@@ -80,10 +83,12 @@ def main():
     print(f"Data:     {data_path}")
     print(f"Output:   {output_path}")
     print(f"Decimate: {args.decimate or 'none (full quality)'}")
+    print(f"Mode:     {'densify-only' if args.densify_only else 'full (densify + mesh + texture)'}")
     print("=" * 60)
 
     # Setup ephemeral workspace
     ws = setup_workspace(data_path)
+    TOTAL_STEPS = TOTAL_STEPS_DENSIFY if args.densify_only else TOTAL_STEPS_FULL
 
     # ── Step 1: InterfaceCOLMAP ───────────────────────────────
     # Fast (<30s) — no patterns, indeterminate is fine
@@ -118,53 +123,54 @@ def main():
         patterns=densify_patterns,
     )
 
-    # ── Step 3: ReconstructMesh ───────────────────────────────
-    mesh_cmd = [
-        "ReconstructMesh",
-        "--input-file", str(ws / "scene_dense.mvs"),
-        "--output-file", str(ws / "scene_mesh.mvs"),
-    ]
-    if args.decimate:
-        mesh_cmd.extend(["--decimate", str(args.decimate)])
+    if not args.densify_only:
+        # ── Step 3: ReconstructMesh ───────────────────────────────
+        mesh_cmd = [
+            "ReconstructMesh",
+            "--input-file", str(ws / "scene_dense.mvs"),
+            "--output-file", str(ws / "scene_mesh.mvs"),
+        ]
+        if args.decimate:
+            mesh_cmd.extend(["--decimate", str(args.decimate)])
 
-    reconstruct_patterns = {
-        r"\b(\d+)%(?!\|)": lambda m: (
-            int(m.group(1)),
-            f"{m.group(1)}%",
-        ),
-        r"(?i)(?:view|face|vertex).{1,30}?(\d+)/(\d+)": lambda m: (
-            round(int(m.group(1)) / int(m.group(2)) * 100),
-            f"Mesh {m.group(1)}/{m.group(2)}",
-        ),
-    }
-    run_with_progress(
-        mesh_cmd,
-        stage="reconstruct_mesh",
-        step=3, total_steps=TOTAL_STEPS,
-        patterns=reconstruct_patterns,
-    )
+        reconstruct_patterns = {
+            r"\b(\d+)%(?!\|)": lambda m: (
+                int(m.group(1)),
+                f"{m.group(1)}%",
+            ),
+            r"(?i)(?:view|face|vertex).{1,30}?(\d+)/(\d+)": lambda m: (
+                round(int(m.group(1)) / int(m.group(2)) * 100),
+                f"Mesh {m.group(1)}/{m.group(2)}",
+            ),
+        }
+        run_with_progress(
+            mesh_cmd,
+            stage="reconstruct_mesh",
+            step=3, total_steps=TOTAL_STEPS,
+            patterns=reconstruct_patterns,
+        )
 
-    # ── Step 4: TextureMesh ───────────────────────────────────
-    # Note: --export-type obj segfaults on v2.3.0, use default MVS+PLY
-    texture_patterns = {
-        r"(?i)(?:view|patch|atlas).{1,30}?(\d+)/(\d+)": lambda m: (
-            round(int(m.group(1)) / int(m.group(2)) * 100),
-            f"Texture {m.group(1)}/{m.group(2)}",
-        ),
-        r"\b(\d+)%(?!\|)": lambda m: (
-            int(m.group(1)),
-            f"{m.group(1)}%",
-        ),
-    }
-    run_with_progress(
-        ["TextureMesh",
-         "--input-file", str(ws / "scene_dense.mvs"),
-         "--mesh-file", str(ws / "scene_mesh.ply"),
-         "--output-file", str(ws / "scene_textured.mvs")],
-        stage="texture_mesh",
-        step=4, total_steps=TOTAL_STEPS,
-        patterns=texture_patterns,
-    )
+        # ── Step 4: TextureMesh ───────────────────────────────────
+        # Note: --export-type obj segfaults on v2.3.0, use default MVS+PLY
+        texture_patterns = {
+            r"(?i)(?:view|patch|atlas).{1,30}?(\d+)/(\d+)": lambda m: (
+                round(int(m.group(1)) / int(m.group(2)) * 100),
+                f"Texture {m.group(1)}/{m.group(2)}",
+            ),
+            r"\b(\d+)%(?!\|)": lambda m: (
+                int(m.group(1)),
+                f"{m.group(1)}%",
+            ),
+        }
+        run_with_progress(
+            ["TextureMesh",
+             "--input-file", str(ws / "scene_dense.mvs"),
+             "--mesh-file", str(ws / "scene_mesh.ply"),
+             "--output-file", str(ws / "scene_textured.mvs")],
+            stage="texture_mesh",
+            step=4, total_steps=TOTAL_STEPS,
+            patterns=texture_patterns,
+        )
 
     # ── Copy results to shared volume ─────────────────────────
     print(f"\nCopying results to {output_path}...")
@@ -174,10 +180,11 @@ def main():
                 shutil.copy2(str(f), str(output_path / f.name))
 
     # Also copy texture atlas files if present
-    for f in ws.glob("scene_textured*"):
-        dst = output_path / f.name
-        if f.is_file() and not dst.exists():
-            shutil.copy2(str(f), str(dst))
+    if not args.densify_only:
+        for f in ws.glob("scene_textured*"):
+            dst = output_path / f.name
+            if f.is_file() and not dst.exists():
+                shutil.copy2(str(f), str(dst))
 
     progress("done", "completed", 100, step=TOTAL_STEPS, total_steps=TOTAL_STEPS)
 

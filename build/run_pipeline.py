@@ -96,15 +96,18 @@ TARGET_IMAGES = {
     ("outdoor", "production"): 600,
     ("outdoor", "proto"):      150,
     ("outdoor", "yono"):       150,
-    ("indoor",  "production"): 600,
+    ("outdoor", "dense"):      600,
+    ("indoor",  "production"): 300,
     ("indoor",  "proto"):      100,
     ("indoor",  "yono"):       100,
+    ("indoor",  "dense"):      300,
 }
 
 RECONSTRUCTION_CONTAINER = {
     ("gaussian", "production"):       "onyx-milo",
     ("gaussian", "proto"):            "onyx-gsplat",
     ("gaussian", "yono"):             "onyx-yonosplat",
+    ("gaussian", "dense"):            "onyx-milo",      # OpenMVS densify → MILo
     ("photogrammetry", "production"): "onyx-openmvs",
     ("photogrammetry", "proto"):      "onyx-openmvs",
 }
@@ -114,7 +117,7 @@ ALL_CONTAINERS = [
     "onyx-instantsfm",
     "onyx-milo",
     "onyx-gsplat",
-    "onyx-yonosplat",
+    # "onyx-yonosplat",  # temporarily excluded from install
     "onyx-openmvs",
     "onyx-segformer",
 ]
@@ -799,11 +802,27 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
         _run_gsplat(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "yono":
         _run_yonosplat(config, state, output_dir, dry_run)
+    elif mode == "gaussian" and quality == "dense":
+        _run_openmvs_densify(config, state, output_dir, dry_run)
+        _run_milo(config, state, output_dir, dry_run,
+                  init_pcd="/data/output/openmvs/scene_dense.ply")
     elif mode == "photogrammetry":
         _run_openmvs(config, state, output_dir, dry_run)
 
 
-def _run_milo(config, state, output_dir, dry_run):
+def _run_openmvs_densify(config, state, output_dir, dry_run):
+    """Run OpenMVS densification only (no mesh), to produce a dense point cloud for MILo."""
+    cmd = [
+        "docker", "run", "--rm", "--gpus", "all",
+        "-v", f"{docker_path(output_dir)}:/data",
+        image_name(config.get("local", False), "onyx-openmvs"),
+        "--data_path", "/data",
+        "--densify-only",
+    ]
+    run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
+
+
+def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
     scene = config["scene"]
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
@@ -818,7 +837,8 @@ def _run_milo(config, state, output_dir, dry_run):
         "--mesh_config", "default",
         "--dense",
     ]
-
+    if init_pcd:
+        cmd.extend(["--init_pcd", init_pcd])
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
 

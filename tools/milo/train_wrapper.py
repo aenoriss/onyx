@@ -56,6 +56,9 @@ def main():
                         help="Extract mesh after training (off by default)")
     parser.add_argument("--skip-training", action="store_true",
                         help="Skip training (use existing checkpoint)")
+    parser.add_argument("--init_pcd", default=None,
+                        help="Path to external point cloud PLY for Gaussian initialization "
+                             "(overrides COLMAP sparse points; placed as output/milo/input.ply)")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -100,6 +103,18 @@ def main():
     print(f"Iterations:  18000 (fixed by configs/fast)")
     print(f"Mesh:        {'Yes' if args.extract_mesh else 'No'}")
     print("=" * 60)
+
+    # ── Pre-place external point cloud (dense init) ───────────
+    if args.init_pcd:
+        import shutil
+        init_src = Path(args.init_pcd)
+        init_dst = output_path / "input.ply"
+        if not init_src.exists():
+            print(f"Warning: --init_pcd file not found: {init_src}")
+        else:
+            output_path.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(init_src), str(init_dst))
+            print(f"[init_pcd] Copied dense cloud → {init_dst} ({init_src.stat().st_size / 1e6:.1f} MB)")
 
     # ── Stage 1: Training ─────────────────────────────────────
     if not args.skip_training:
