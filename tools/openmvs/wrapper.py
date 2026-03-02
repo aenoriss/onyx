@@ -109,7 +109,8 @@ def main():
     run_with_progress(
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
-         "--output-file", str(ws / "scene_dense.mvs")],
+         "--output-file", str(ws / "scene_dense.mvs"),
+         "--min-views-filter", "1"],  # allow images with few neighbors (e.g. 360 up/down crops)
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
