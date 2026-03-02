@@ -109,8 +109,7 @@ def main():
     run_with_progress(
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
-         "--output-file", str(ws / "scene_dense.mvs"),
-         "--geometric-iters", "0"],  # skip geom-consistency, go straight to fusion (isolation test)
+         "--output-file", str(ws / "scene_dense.mvs")],
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
