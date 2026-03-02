@@ -110,7 +110,7 @@ def main():
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
          "--output-file", str(ws / "scene_dense.mvs"),
-         "--resolution-level", "2"],  # halve each dimension (¼ memory) — required on 32 GiB RAM
+         "--resolution-level", "1"],  # half resolution (¼ memory vs full) — safe on 32 GiB, ~500k-5M fused pts for GS init
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
