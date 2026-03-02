@@ -38,12 +38,6 @@ RUN sed -i 's/use_opengl=True/use_opengl=False/g' milo/scene/mesh.py
 # Patch for CUDA 12.6 compatibility: add missing #include <cfloat> for FLT_MAX
 RUN sed -i '1i #include <cfloat>' submodules/simple-knn/simple_knn.cu
 
-# Patch train.py: wrap nvdiffrast.torch.rasterize in try/except for CUDA error 700
-# (some GPU drivers trigger cudaErrorIllegalAddress in nvdiffrast's kernel at the
-# first mesh regularization call; this lets training complete normally)
-COPY tools/milo/patch_nvdiffrast.py /tmp/patch_nvdiffrast.py
-RUN python3 /tmp/patch_nvdiffrast.py
-
 # Install Python requirements
 RUN pip install --no-cache-dir -r requirements.txt
 
