@@ -145,12 +145,14 @@ def detect_360(path):
         pass
 
     # Aspect ratio heuristic: 2:1 = equirectangular
+    # Note: some 360 cameras output 16:9 (1.778) equirectangular — don't False-match those.
+    # Only return False for clearly-portrait or square videos (< 1.5).
     w, h = get_video_dimensions(path)
     if w and h:
         ratio = w / h
         if abs(ratio - 2.0) < 0.05:  # within 2.5% of 2:1
             return True
-        if ratio < 1.8:  # clearly not 2:1
+        if ratio < 1.5:  # portrait or square — definitely not equirectangular
             return False
 
     return None
