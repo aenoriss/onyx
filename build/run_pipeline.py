@@ -93,10 +93,10 @@ RUN_STEPS = ["RECONSTRUCTION", "SEGFORMER"]
 ALL_STEPS = SHARED_STEPS + RUN_STEPS
 
 TARGET_IMAGES = {
-    ("outdoor", "production"): 300,
+    ("outdoor", "production"): 600,
     ("outdoor", "proto"):      150,
     ("outdoor", "yono"):       150,
-    ("indoor",  "production"): 150,
+    ("indoor",  "production"): 600,
     ("indoor",  "proto"):      100,
     ("indoor",  "yono"):       100,
 }
@@ -816,6 +816,7 @@ def _run_milo(config, state, output_dir, dry_run):
         "--rasterizer", "radegs",
         "--extract-mesh",
         "--mesh_config", "default",
+        "--dense",
     ]
 
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
