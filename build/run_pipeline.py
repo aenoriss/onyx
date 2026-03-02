@@ -832,6 +832,7 @@ def _run_openmvs_densify(config, state, output_dir, dry_run):
     """Run OpenMVS densification only (no mesh), to produce a dense point cloud for MILo."""
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
+        *uid_gid_flags(),
         "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), "onyx-openmvs"),
         "--data_path", "/data",
@@ -881,6 +882,7 @@ def _run_openmvs(config, state, output_dir, dry_run):
     quality = config["quality"]
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
+        *uid_gid_flags(),
         "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), "onyx-openmvs"),
         "--data_path", "/data",
