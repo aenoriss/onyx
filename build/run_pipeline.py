@@ -815,9 +815,7 @@ def _run_milo(config, state, output_dir, dry_run):
         "--metric", scene,
         "--rasterizer", "radegs",
         "--extract-mesh",
-        # indoor: verylowres reduces SDF mesh complexity during training,
-        # which avoids nvdiffrast CUDA error 700 on some GPUs/drivers
-        *(["--mesh_config", "verylowres"] if scene == "indoor" else []),
+        "--mesh_config", "default",
     ]
 
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)

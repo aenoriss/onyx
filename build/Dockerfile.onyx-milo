@@ -38,6 +38,12 @@ RUN sed -i 's/use_opengl=True/use_opengl=False/g' milo/scene/mesh.py
 # Patch for CUDA 12.6 compatibility: add missing #include <cfloat> for FLT_MAX
 RUN sed -i '1i #include <cfloat>' submodules/simple-knn/simple_knn.cu
 
+# Patch train.py: wrap nvdiffrast.torch.rasterize in try/except for CUDA error 700
+# (some GPU drivers trigger cudaErrorIllegalAddress in nvdiffrast's kernel at the
+# first mesh regularization call; this lets training complete normally)
+COPY tools/milo/patch_nvdiffrast.py /tmp/patch_nvdiffrast.py
+RUN python3 /tmp/patch_nvdiffrast.py
+
 # Install Python requirements
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -70,6 +76,12 @@ WORKDIR /workspace/MILo
 # Copy training wrapper script
 ARG CACHE_BUST=1
 COPY tools/milo/train_wrapper.py /workspace/train_wrapper.py
+
+# Pin torch cache to a fixed path so pre-downloaded weights survive HOME=/tmp at runtime
+ENV TORCH_HOME=/workspace/.torch
+
+# Pre-download VGG16 weights for LPIPS (MILo evaluates LPIPS at test iterations)
+RUN python3 -c "from torchvision.models import vgg16, VGG16_Weights; vgg16(weights=VGG16_Weights.IMAGENET1K_V1)"
 
 # NVIDIA container capabilities (graphics needed for nvdiffrast rendering)
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
