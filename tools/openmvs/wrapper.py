@@ -110,7 +110,8 @@ def main():
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
          "--output-file", str(ws / "scene_dense.mvs"),
-         "--verbosity", "1"],  # fix: default verbosity=2 has logging buffer overflow bug in v2.3.0 (fixed in develop, not stable)
+         "--estimate-roi", "0",   # fix: v2.3.0 regression — unbounded scene detection returns null ROI
+         "--crop-to-roi", "0"],  # which causes crop-to-roi to crash; disable ROI handling entirely
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
