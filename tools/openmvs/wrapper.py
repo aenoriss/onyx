@@ -110,7 +110,7 @@ def main():
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
          "--output-file", str(ws / "scene_dense.mvs"),
-         "--max-threads", "1"],  # single-threaded fusion — avoids segfault in threaded fusion on 360° scenes
+         "--geometric-iters", "0"],  # skip geom-consistency, go straight to fusion (isolation test)
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
