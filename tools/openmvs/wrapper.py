@@ -43,9 +43,10 @@ def setup_workspace(data_path):
         shutil.copy2(str(f), str(sparse_dst / f.name))
 
     # InterfaceCOLMAP stores absolute image paths in .mvs file
-    # Symlink images to a stable path that persists across steps
+    # Symlink images to a stable path that persists across steps.
+    # Use /tmp/onyx_images (writable by any user) instead of /root/images.
     images_src = Path(data_path) / "images"
-    images_dst = Path("/root/images")
+    images_dst = Path("/tmp/onyx_images")
     if images_dst.exists() or images_dst.is_symlink():
         images_dst.unlink()
     images_dst.symlink_to(images_src)
@@ -95,7 +96,7 @@ def main():
     run_with_progress(
         ["InterfaceCOLMAP",
          "--input-file", str(ws),
-         "--image-folder", "/root/images",
+         "--image-folder", "/tmp/onyx_images",
          "--output-file", str(ws / "scene.mvs")],
         stage="interface_colmap",
         step=1, total_steps=TOTAL_STEPS,
