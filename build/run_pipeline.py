@@ -191,10 +191,28 @@ def check_image_exists(image):
     return result.returncode == 0
 
 
-def check_images_installed(local=False):
-    """Check that all pipeline images are pulled. Returns (ok, missing)."""
+def get_required_containers(config=None):
+    """Return the minimal set of containers needed for a given config."""
+    if config is None:
+        return ALL_CONTAINERS  # --install: check everything
+    mode = config.get("mode", "gaussian")
+    quality = config.get("quality", "production")
+    containers = ["onyx-ingest", "onyx-instantsfm"]
+    recon = RECONSTRUCTION_CONTAINER.get((mode, quality))
+    if recon:
+        containers.append(recon)
+    # dense mode also needs openmvs for the densify step
+    if mode == "gaussian" and quality == "dense":
+        containers.append("onyx-openmvs")
+    if config.get("segment"):
+        containers.append("onyx-segformer")
+    return containers
+
+
+def check_images_installed(local=False, config=None):
+    """Check that required pipeline images are pulled. Returns (ok, missing)."""
     missing = []
-    for container in ALL_CONTAINERS:
+    for container in get_required_containers(config):
         img = image_name(local, container)
         if not check_image_exists(img):
             missing.append(container)
@@ -1624,7 +1642,7 @@ def main():
 
     # ── Pre-run: verify Docker images installed ────────────────
     if not args.dry_run:
-        ok, missing = check_images_installed(local=args.local or config.get("local", False))
+        ok, missing = check_images_installed(local=args.local or config.get("local", False), config=config)
         if not ok:
             print(f"\nError: {len(missing)} container image(s) not found:")
             for name in missing:
