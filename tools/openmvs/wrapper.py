@@ -110,7 +110,7 @@ def main():
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
          "--output-file", str(ws / "scene_dense.mvs"),
-         "--number-views-fuse", "2"],  # default 3; relax for 360 up/down crops with few consistent views
+         "--number-views-fuse", "1"],  # <2 = only merge depth-maps, no consistency check (needed for 360 crops)
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
