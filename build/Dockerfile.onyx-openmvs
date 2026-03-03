@@ -40,8 +40,27 @@ RUN git clone --depth 1 https://github.com/jlblancoc/nanoflann.git && \
 RUN git clone --depth 1 https://github.com/cnr-isti-vclab/vcglib.git
 ENV VCG_ROOT=/opt/vcglib
 
-# Clone OpenMVS v2.1.0 (v2.3.0 has unfixed crash on unbounded 360° scenes; v2.1.0 confirmed working)
+# Clone OpenMVS v2.1.0
 RUN git clone --branch v2.1.0 --depth 1 https://github.com/cdcseacave/openMVS.git
+
+# Patch: skip empty depth maps in FilterDepthMaps to fix crash on 360° scenes.
+# Root cause: DenseReconstructionFilter guards with IsValid() but not IsEmpty().
+# FilterDepthMap then hits ASSERT(!IsEmpty()) → exit(1) when geom-consistency
+# empties a depth map for cameras with no stereo coverage (e.g. floor/ceiling
+# crops in 360° rigs). MergeDepthMaps/FuseDepthMaps already handle empty maps
+# gracefully — this patch makes the filter caller consistent with them.
+RUN python3 -c "
+import re, sys
+path = '/opt/openMVS/libs/MVS/SceneDensify.cpp'
+txt = open(path).read()
+old = r'if \(!depthData\.IsValid\(\)\) \{(\s+data\.SignalCompleteDepthmapFilter)'
+new = r'if (!depthData.IsValid() || depthData.IsEmpty()) {\1'
+matches = re.findall(old, txt)
+assert len(matches) == 1, f'Expected 1 match, got {len(matches)}'
+txt = re.sub(old, new, txt, count=1)
+open(path, 'w').write(txt)
+print('Patch applied: FilterDepthMaps now skips empty depth maps')
+"
 
 # Build OpenMVS with CUDA
 WORKDIR /opt/openMVS/build

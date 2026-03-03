@@ -109,8 +109,7 @@ def main():
     run_with_progress(
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
-         "--output-file", str(ws / "scene_dense.mvs"),
-         "--number-views-fuse", "1"],  # fix: MergeDepthMaps (nMinViewsFuse<2) instead of FuseDepthMaps (fails for unbounded 360° scenes)
+         "--output-file", str(ws / "scene_dense.mvs")],
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
