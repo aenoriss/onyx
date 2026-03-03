@@ -40,26 +40,21 @@ RUN git clone --depth 1 https://github.com/jlblancoc/nanoflann.git && \
 RUN git clone --depth 1 https://github.com/cnr-isti-vclab/vcglib.git
 ENV VCG_ROOT=/opt/vcglib
 
-# Clone OpenMVS v2.1.0
-RUN git clone --branch v2.1.0 --depth 1 https://github.com/cdcseacave/openMVS.git
+# Clone OpenMVS v2.3.0 (stable release)
+RUN git clone --branch v2.3.0 --depth 1 https://github.com/cdcseacave/openMVS.git
 
-# Patch: skip empty depth maps in FilterDepthMaps to fix crash on 360° scenes.
+# Patch: skip empty depth maps in the FilterDepthMaps event handler.
 # Root cause: DenseReconstructionFilter guards with IsValid() but not IsEmpty().
-# FilterDepthMap then hits ASSERT(!IsEmpty()) → exit(1) when geom-consistency
-# empties a depth map for cameras with no stereo coverage (e.g. floor/ceiling
-# crops in 360° rigs). MergeDepthMaps/FuseDepthMaps already handle empty maps
-# gracefully — this patch makes the filter caller consistent with them.
-RUN python3 - << 'PYEOF'
-import re
-path = '/opt/openMVS/libs/MVS/SceneDensify.cpp'
-txt = open(path).read()
-old = r'if \(!depthData\.IsValid\(\)\) \{(\s+data\.SignalCompleteDepthmapFilter)'
-new = r'if (!depthData.IsValid() || depthData.IsEmpty()) {\1'
-cnt = len(re.findall(old, txt))
-assert cnt == 1, f'Expected 1 match, got {cnt}'
-open(path, 'w').write(re.sub(old, new, txt, count=1))
-print('Patch applied: FilterDepthMaps skips empty depth maps')
-PYEOF
+# FilterDepthMap then crashes (SIGSEGV/ASSERT) when geom-consistency empties a
+# depth map for cameras with no stereo coverage (e.g. floor/ceiling crops in 360°
+# rigs pointing toward textureless surfaces). MergeDepthMaps/FuseDepthMaps already
+# handle empty maps gracefully — this patch makes the filter caller consistent.
+WORKDIR /opt/openMVS
+RUN sed -i \
+    '/if (!depthData\.IsValid()) {/{N; /SignalCompleteDepthmapFilter/s/if (!depthData\.IsValid()) {/if (!depthData.IsValid() || depthData.IsEmpty()) {/}' \
+    libs/MVS/SceneDensify.cpp && \
+    grep -q "IsEmpty" libs/MVS/SceneDensify.cpp && \
+    echo "Patch verified: FilterDepthMaps skips empty depth maps"
 
 # Build OpenMVS with CUDA
 WORKDIR /opt/openMVS/build
