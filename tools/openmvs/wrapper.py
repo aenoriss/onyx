@@ -55,6 +55,9 @@ def main():
                         help="Output directory (default: data_path/output/openmvs)")
     parser.add_argument("--densify-only", action="store_true",
                         help="Only run InterfaceCOLMAP + DensifyPointCloud (skip mesh steps)")
+    parser.add_argument("--no-geom-consistency", action="store_true",
+                        help="Disable geometric-consistency refinement (--geometric-iters 0). "
+                             "Use for 360° scenes where some cameras have no stereo overlap.")
     args = parser.parse_args()
 
     data_path = Path(args.data_path).resolve()
@@ -76,6 +79,7 @@ def main():
     print(f"Output:   {output_path}")
     print(f"Decimate: {args.decimate or 'none (full quality)'}")
     print(f"Mode:     {'densify-only' if args.densify_only else 'full (densify + mesh + texture)'}")
+    print(f"GeomCons: {'disabled (--geometric-iters 0)' if args.no_geom_consistency else 'enabled (default)'}")
     print("=" * 60)
 
     # Setup ephemeral workspace
@@ -106,10 +110,15 @@ def main():
             f"{m.group(1)}%",
         ),
     }
+    densify_cmd = [
+        "DensifyPointCloud",
+        "--input-file", str(ws / "scene.mvs"),
+        "--output-file", str(ws / "scene_dense.mvs"),
+    ]
+    if args.no_geom_consistency:
+        densify_cmd.extend(["--geometric-iters", "0"])
     run_with_progress(
-        ["DensifyPointCloud",
-         "--input-file", str(ws / "scene.mvs"),
-         "--output-file", str(ws / "scene_dense.mvs")],
+        densify_cmd,
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
