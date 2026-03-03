@@ -110,7 +110,7 @@ def main():
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
          "--output-file", str(ws / "scene_dense.mvs"),
-         "--tower-mode", "0"],  # fix: default tower-mode=4 uses ROI center which is null for unbounded scenes → crash
+],
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,

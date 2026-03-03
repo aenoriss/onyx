@@ -40,8 +40,8 @@ RUN git clone --depth 1 https://github.com/jlblancoc/nanoflann.git && \
 RUN git clone --depth 1 https://github.com/cnr-isti-vclab/vcglib.git
 ENV VCG_ROOT=/opt/vcglib
 
-# Clone OpenMVS v2.3.0 (stable release)
-RUN git clone --branch v2.3.0 --depth 1 https://github.com/cdcseacave/openMVS.git
+# Clone OpenMVS v2.4.0 (v2.3.0 had unfixed crash on unbounded 360° scenes — ROI fixed in v2.4.0)
+RUN git clone --branch v2.4.0 --depth 1 https://github.com/cdcseacave/openMVS.git
 
 # Build OpenMVS with CUDA
 WORKDIR /opt/openMVS/build
