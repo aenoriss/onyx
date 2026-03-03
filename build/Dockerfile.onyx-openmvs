@@ -21,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpng-dev \
     libjpeg-dev \
     libtiff-dev \
-    libjxl-dev \
     # Graphics
     libglu1-mesa-dev \
     libglfw3-dev \
@@ -43,6 +42,9 @@ ENV VCG_ROOT=/opt/vcglib
 
 # Clone OpenMVS v2.4.0 (v2.3.0 had unfixed crash on unbounded 360° scenes — ROI fixed in v2.4.0)
 RUN git clone --branch v2.4.0 --depth 1 https://github.com/cdcseacave/openMVS.git
+
+# Patch out libjxl (not available in Ubuntu 22.04 repos; feature not needed)
+RUN sed -i 's/pkg_check_modules_fullpath_libs(JPEGXL libjxl)/# libjxl disabled/' /opt/openMVS/libs/IO/CMakeLists.txt
 
 # Build OpenMVS with CUDA
 WORKDIR /opt/openMVS/build
