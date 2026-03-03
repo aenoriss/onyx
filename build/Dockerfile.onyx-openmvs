@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpng-dev \
     libjpeg-dev \
     libtiff-dev \
+    libjxl-dev \
     # Graphics
     libglu1-mesa-dev \
     libglfw3-dev \
