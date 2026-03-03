@@ -838,11 +838,6 @@ def _run_openmvs_densify(config, state, output_dir, dry_run):
         "--data_path", "/data",
         "--densify-only",
     ]
-    # 360° rigs have cameras pointing at floor/ceiling with no stereo overlap.
-    # Geom-consistency cascades failures from those empty depth maps to neighbours,
-    # resulting in 0 fused points. Disable it for 360° inputs.
-    if config.get("video") == "360":
-        cmd.append("--no-geom-consistency")
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
 

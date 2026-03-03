@@ -43,18 +43,32 @@ ENV VCG_ROOT=/opt/vcglib
 # Clone OpenMVS v2.3.0 (stable release)
 RUN git clone --branch v2.3.0 --depth 1 https://github.com/cdcseacave/openMVS.git
 
-# Patch: skip empty depth maps in the FilterDepthMaps event handler.
+# Patch 1: skip empty depth maps in the FilterDepthMaps event handler.
 # Root cause: DenseReconstructionFilter guards with IsValid() but not IsEmpty().
 # FilterDepthMap then crashes (SIGSEGV/ASSERT) when geom-consistency empties a
 # depth map for cameras with no stereo coverage (e.g. floor/ceiling crops in 360°
 # rigs pointing toward textureless surfaces). MergeDepthMaps/FuseDepthMaps already
 # handle empty maps gracefully — this patch makes the filter caller consistent.
+#
+# Patch 2: preserve photometric depth maps when geom-consistency fails to produce
+# a geo.dmap replacement. Root cause: after each geom-consistency iteration OpenMVS
+# unconditionally deletes rawName (the photometric dmap), then renames geo.dmap over
+# it. For cameras whose neighbors are missing depth maps (e.g. 360° floor/ceiling
+# cameras with 0 stereo pairs), geo.dmap is never created — so deleteFile removes
+# the only valid depth data and FuseDepthMaps finds nothing → 0 fused points.
+# Fix: only delete+rename when geo.dmap actually exists; cameras that completed
+# geom-consistency get refined depths, cameras that did not keep photometric depths.
 WORKDIR /opt/openMVS
 RUN sed -i \
     '/if (!depthData\.IsValid()) {/{N; /SignalCompleteDepthmapFilter/s/if (!depthData\.IsValid()) {/if (!depthData.IsValid() || depthData.IsEmpty()) {/}' \
     libs/MVS/SceneDensify.cpp && \
     grep -q "IsEmpty" libs/MVS/SceneDensify.cpp && \
-    echo "Patch verified: FilterDepthMaps skips empty depth maps"
+    echo "Patch 1 verified: FilterDepthMaps skips empty depth maps" && \
+    sed -i \
+    '/File::deleteFile(rawName);/{N; /File::renameFile.*geo\.dmap/s/.*\n.*/\t\tif (File::isFile(ComposeDepthFilePath(depthData.GetView().GetID(), "geo.dmap"))) { File::deleteFile(rawName); File::renameFile(ComposeDepthFilePath(depthData.GetView().GetID(), "geo.dmap"), rawName); }/}' \
+    libs/MVS/SceneDensify.cpp && \
+    grep -q "File::isFile.*geo.dmap" libs/MVS/SceneDensify.cpp && \
+    echo "Patch 2 verified: geom-consistency preserves depth maps when geo.dmap missing"
 
 # Build OpenMVS with CUDA
 WORKDIR /opt/openMVS/build
