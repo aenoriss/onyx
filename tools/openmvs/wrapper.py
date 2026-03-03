@@ -110,8 +110,7 @@ def main():
         ["DensifyPointCloud",
          "--input-file", str(ws / "scene.mvs"),
          "--output-file", str(ws / "scene_dense.mvs"),
-         "--estimate-roi", "0",   # fix: v2.3.0 regression — unbounded scene detection returns null ROI
-         "--crop-to-roi", "0"],  # which causes crop-to-roi to crash; disable ROI handling entirely
+         "--tower-mode", "0"],  # fix: default tower-mode=4 uses ROI center which is null for unbounded scenes → crash
         stage="densify_pointcloud",
         step=2, total_steps=TOTAL_STEPS,
         patterns=densify_patterns,
