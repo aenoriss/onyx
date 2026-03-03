@@ -40,11 +40,8 @@ RUN git clone --depth 1 https://github.com/jlblancoc/nanoflann.git && \
 RUN git clone --depth 1 https://github.com/cnr-isti-vclab/vcglib.git
 ENV VCG_ROOT=/opt/vcglib
 
-# Clone OpenMVS v2.4.0 (v2.3.0 had unfixed crash on unbounded 360° scenes — ROI fixed in v2.4.0)
-RUN git clone --branch v2.4.0 --depth 1 https://github.com/cdcseacave/openMVS.git
-
-# Patch out libjxl (not available in Ubuntu 22.04 repos; feature not needed)
-RUN sed -i 's/pkg_check_modules_fullpath_libs(JPEGXL libjxl)/# libjxl disabled/' /opt/openMVS/libs/IO/CMakeLists.txt
+# Clone OpenMVS v2.1.0 (v2.3.0 has unfixed crash on unbounded 360° scenes; v2.1.0 confirmed working)
+RUN git clone --branch v2.1.0 --depth 1 https://github.com/cdcseacave/openMVS.git
 
 # Build OpenMVS with CUDA
 WORKDIR /opt/openMVS/build
