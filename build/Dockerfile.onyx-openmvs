@@ -49,18 +49,17 @@ RUN git clone --branch v2.1.0 --depth 1 https://github.com/cdcseacave/openMVS.gi
 # empties a depth map for cameras with no stereo coverage (e.g. floor/ceiling
 # crops in 360° rigs). MergeDepthMaps/FuseDepthMaps already handle empty maps
 # gracefully — this patch makes the filter caller consistent with them.
-RUN python3 -c "
-import re, sys
+RUN python3 - << 'PYEOF'
+import re
 path = '/opt/openMVS/libs/MVS/SceneDensify.cpp'
 txt = open(path).read()
 old = r'if \(!depthData\.IsValid\(\)\) \{(\s+data\.SignalCompleteDepthmapFilter)'
 new = r'if (!depthData.IsValid() || depthData.IsEmpty()) {\1'
-matches = re.findall(old, txt)
-assert len(matches) == 1, f'Expected 1 match, got {len(matches)}'
-txt = re.sub(old, new, txt, count=1)
-open(path, 'w').write(txt)
-print('Patch applied: FilterDepthMaps now skips empty depth maps')
-"
+cnt = len(re.findall(old, txt))
+assert cnt == 1, f'Expected 1 match, got {cnt}'
+open(path, 'w').write(re.sub(old, new, txt, count=1))
+print('Patch applied: FilterDepthMaps skips empty depth maps')
+PYEOF
 
 # Build OpenMVS with CUDA
 WORKDIR /opt/openMVS/build
