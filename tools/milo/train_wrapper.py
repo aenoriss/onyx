@@ -32,6 +32,67 @@ MILO_DIR = "/workspace/MILo/milo"
 TOTAL_ITERATIONS = 18000
 
 
+def _process_dense_init(init_src, sparse_path, target_pts=500_000):
+    """Subsample a dense PLY cloud and inject it as sparse/0/points3D.bin.
+
+    MILo reads points3D.bin and discards tracks entirely, so we write empty
+    tracks. Camera poses (cameras.bin / images.bin) are untouched.
+    """
+    import struct
+    import numpy as np
+    import open3d as o3d
+    import shutil
+
+    print(f"[dense_init] Loading {init_src} ...")
+    pcd = o3d.io.read_point_cloud(str(init_src))
+    print(f"[dense_init] Loaded {len(pcd.points):,} points")
+
+    # Stage 1: Statistical outlier removal (removes noise/floaters)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    print(f"[dense_init] After SOR: {len(pcd.points):,} points")
+
+    # Stage 2: Uniform random subsample to target
+    # Voxel-based downsampling is unreliable for surface point clouds (MVS output
+    # lies on 2D surfaces, not in 3D volumes), so the volumetric voxel formula
+    # produces wildly wrong voxel sizes. Random subsampling guarantees exactly
+    # target_pts regardless of scene type or point distribution.
+    pts = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)  # float [0,1]; may be empty if PLY has no color
+
+    if len(colors) == 0 or colors.shape[0] != len(pts):
+        print("[dense_init] Warning: no color data in PLY — defaulting to white")
+        colors = np.ones((len(pts), 3), dtype=np.float32)
+
+    if len(pts) > target_pts:
+        idx = np.random.choice(len(pts), target_pts, replace=False)
+        pts, colors = pts[idx], colors[idx]
+
+    rgb = (colors * 255).clip(0, 255).astype(np.uint8)
+    print(f"[dense_init] Final count: {len(pts):,} points")
+
+    # Backup original sparse cloud (only once — skip if backup already exists)
+    bin_path = sparse_path / "points3D.bin"
+    backup_path = sparse_path / "points3D.bin.sparse_backup"
+    if bin_path.exists() and not backup_path.exists():
+        shutil.copy2(str(bin_path), str(backup_path))
+        print(f"[dense_init] Backed up sparse cloud → {backup_path.name}")
+
+    # Write COLMAP binary points3D.bin with empty tracks (error=0)
+    # Format: num_pts(Q) | [point3D_id(Q) xyz(ddd) rgb(BBB) error(d) track_len(Q)] * N
+    # Use '<' (little-endian, standard sizes) to match MILo's read_points3D_binary
+    with open(str(bin_path), 'wb') as f:
+        f.write(struct.pack('<Q', len(pts)))
+        for i, (pt, color) in enumerate(zip(pts, rgb)):
+            f.write(struct.pack('<QdddBBBd',
+                i + 1,
+                float(pt[0]), float(pt[1]), float(pt[2]),
+                int(color[0]), int(color[1]), int(color[2]),
+                0.0,  # reprojection error (unused by MILo)
+            ))
+            f.write(struct.pack('<Q', 0))  # track_length = 0 (no 2D observations)
+    print(f"[dense_init] Written {len(pts):,} dense points → {bin_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="MILo training wrapper")
     parser.add_argument("--scene", "-s", required=True,
@@ -58,7 +119,9 @@ def main():
                         help="Skip training (use existing checkpoint)")
     parser.add_argument("--init_pcd", default=None,
                         help="Path to external point cloud PLY for Gaussian initialization "
-                             "(overrides COLMAP sparse points; placed as output/milo/input.ply)")
+                             "(injected as sparse/0/points3D.bin before MILo reads it)")
+    parser.add_argument("--dense_init_pts", type=int, default=500_000,
+                        help="Target point count when subsampling the dense init cloud (default: 500000)")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -106,15 +169,11 @@ def main():
 
     # ── Pre-place external point cloud (dense init) ───────────
     if args.init_pcd:
-        import shutil
         init_src = Path(args.init_pcd)
-        init_dst = output_path / "input.ply"
         if not init_src.exists():
             print(f"Warning: --init_pcd file not found: {init_src}")
         else:
-            output_path.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(init_src), str(init_dst))
-            print(f"[init_pcd] Copied dense cloud → {init_dst} ({init_src.stat().st_size / 1e6:.1f} MB)")
+            _process_dense_init(init_src, sparse_path, args.dense_init_pts)
 
     # ── Stage 1: Training ─────────────────────────────────────
     if not args.skip_training:

@@ -830,6 +830,11 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
 
 def _run_openmvs_densify(config, state, output_dir, dry_run):
     """Run OpenMVS densification only (no mesh), to produce a dense point cloud for MILo."""
+    dense_ply = output_dir / "output" / "openmvs" / "scene_dense.ply"
+    if dense_ply.exists():
+        print(f"[SKIP] OpenMVS densify — {dense_ply} already exists ({dense_ply.stat().st_size / 1e9:.2f} GB)")
+        return
+
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
@@ -854,10 +859,14 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
         "--rasterizer", "radegs",
         "--extract-mesh",
         "--mesh_config", "default",
-        "--dense",
     ]
     if init_pcd:
-        cmd.extend(["--init_pcd", init_pcd])
+        # Dense MVS init already provides geometric coverage — skip --dense_gaussians
+        # to avoid aggressive densification causing OOM with many cameras
+        cmd.extend(["--init_pcd", init_pcd,
+                    "--dense_init_pts", "100000"])
+    else:
+        cmd.append("--dense")
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
 
