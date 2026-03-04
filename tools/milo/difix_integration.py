@@ -3,19 +3,30 @@
 Provides render-enhance-train fix cycles using NVIDIA Difix3D+ (SD-Turbo based).
 Loaded only when --difix3d is passed to MILo's train.py.
 
-Fix cycle at each scheduled iteration:
-  1. Sample n_views pairs of distant training cameras (diverse coverage).
-  2. SLERP rotation + LERP translation to obtain a midpoint novel-view pose.
+Two-phase approach (matching the Difix3D+ baseline):
+
+Phase 1 — Fix cycles (at scheduled iterations 9000 / 13000 / 17000):
+  1. Sample n_views pairs of distant training cameras.
+  2. SLERP rotation + LERP translation to obtain a novel-view pose.
   3. Render the current scene at the novel pose (no_grad).
   4. Run Difix on the render to produce an enhanced pseudo-GT image.
-  5. Perform n_grad_steps gradient updates (L1 + D-SSIM) against the enhanced image.
+  5. Perform n_grad_steps immediate gradient updates against the enhanced image.
+  6. Append (synthetic_camera, enhanced_image_cpu) to the novel_data_pool
+     so it can be reused in subsequent training iterations.
 
-Mesh-in-the-loop regularization is NOT applied during these extra steps;
+Phase 2 — Novel data reuse (every iteration after first fix cycle):
+  With probability novel_data_lambda (~0.3), sample a random entry from
+  novel_data_pool and perform one extra gradient step against that stored
+  enhanced image.  This mirrors the --novel_data_lambda mechanism in
+  Difix3D+'s simple_trainer_difix3d.py.
+
+Mesh-in-the-loop regularization is NOT applied during either phase;
 only the Gaussian appearance parameters are updated.
 """
 
 import sys
 from dataclasses import dataclass
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -23,6 +34,9 @@ from PIL import Image as PILImage
 
 _DIFIX_PROMPT = "remove degradation"
 _DIFIX_TIMESTEPS = [199]
+# Maximum entries kept in the novel data pool (oldest evicted beyond this limit).
+# At 800×1200 px, 200 images ≈ 2.3 GB on CPU RAM — acceptable for 32 GB hosts.
+_MAX_POOL_SIZE = 200
 
 
 # ── Synthetic camera ──────────────────────────────────────────────────────────
@@ -66,22 +80,19 @@ def _interpolate_camera(
 
     device = cam_a.world_view_transform.device
 
-    # ── rotation: extract R (not R^T) from each WVT ──────────────────────────
     # WVT[:3, :3] = R^T  →  R = (R^T)^T
     R_T_a = cam_a.world_view_transform[:3, :3].cpu().float().numpy()
     R_T_b = cam_b.world_view_transform[:3, :3].cpu().float().numpy()
 
     rots = Rotation.from_matrix(np.stack([R_T_a.T, R_T_b.T]))
     slerp = Slerp([0.0, 1.0], rots)
-    R_interp = slerp([float(t)]).as_matrix()[0]  # [3, 3]
-    R_T_interp = R_interp.T                       # back to R^T for WVT
+    R_interp = slerp([float(t)]).as_matrix()[0]   # [3, 3]
+    R_T_interp = R_interp.T                        # back to R^T for WVT
 
-    # ── camera centre: LERP in world space ────────────────────────────────────
     cc_a = cam_a.camera_center.cpu().float().numpy()
     cc_b = cam_b.camera_center.cpu().float().numpy()
-    cc_interp = (1.0 - t) * cc_a + t * cc_b       # [3]
+    cc_interp = (1.0 - t) * cc_a + t * cc_b        # [3]
 
-    # ── rebuild WVT ───────────────────────────────────────────────────────────
     # WVT[:3,:3] = R^T,  WVT[3,:3] = t_view = -R @ cc
     wvt_np = np.zeros((4, 4), dtype=np.float32)
     wvt_np[:3, :3] = R_T_interp
@@ -90,10 +101,8 @@ def _interpolate_camera(
 
     wvt = torch.tensor(wvt_np, dtype=torch.float32, device=device)
 
-    # ── projection matrix: copy / extract from cam_a ─────────────────────────
     proj = getattr(cam_a, "projection_matrix", None)
     if proj is None:
-        # Extract from FPT = WVT @ proj  →  proj = WVT^{-1} @ FPT
         proj = torch.inverse(cam_a.world_view_transform) @ cam_a.full_proj_transform
 
     fpt = wvt.unsqueeze(0).bmm(proj.unsqueeze(0)).squeeze(0)
@@ -148,7 +157,7 @@ def _pil_to_tensor(img: PILImage.Image, device: str = "cuda") -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).to(device)
 
 
-# ── main fix-cycle function ───────────────────────────────────────────────────
+# ── Phase 1: fix cycle ────────────────────────────────────────────────────────
 
 def difix_fix_step(
     gaussians,
@@ -160,24 +169,24 @@ def difix_fix_step(
     opt,
     background: torch.Tensor,
     iteration: int,
-    n_views: int = 16,
+    novel_data_pool: List[Tuple],   # mutable list; (synth_cam, enhanced_cpu) appended here
+    n_views: int = 48,
     n_grad_steps: int = 1,
     lambda_dssim: float = 0.2,
 ) -> None:
     """Run one Difix3D+ fix cycle within MILo training.
 
-    Generates n_views novel-view cameras by SLERP-interpolating between
-    randomly sampled pairs of training cameras, then:
-      - renders each novel view with the current Gaussians (no_grad),
-      - enhances the render with Difix to get a pseudo-GT image,
-      - performs n_grad_steps gradient update steps against the pseudo-GT.
+    Generates n_views novel-view cameras (diverse distant-pair SLERP),
+    then for each:
+      - renders the current scene (no_grad),
+      - enhances with Difix → pseudo-GT,
+      - performs n_grad_steps immediate gradient updates,
+      - appends (synth_cam, enhanced_image_cpu) to novel_data_pool for reuse.
 
-    Parameters
-    ----------
-    render_func : callable
-        The rasterizer render function (render_radegs or render_gof), with
-        signature: render_func(cam, gaussians, pipe, background,
-                               require_coord, require_depth) → render_pkg.
+    Camera-pair strategy (CuriGS CVPR 2025 + InstantSplat):
+      - Anchor: shuffled permutation of training cameras.
+      - Partner: drawn from top-3 FURTHEST cameras from the anchor.
+      - t: uniform random in [0.15, 0.85] for varied interpolation depth.
     """
     from utils.loss_utils import l1_loss    # noqa: PLC0415
     from fused_ssim import fused_ssim       # noqa: PLC0415
@@ -192,54 +201,42 @@ def difix_fix_step(
         print("[difix] Need ≥2 training cameras for interpolation — skipping.")
         return
 
-    # ── pair sampling: diverse DISTANT-pair selection ────────────────────────
-    # Strategy (CuriGS CVPR 2025 + InstantSplat co-visibility):
-    #   - Anchor cam_a: different for each view (shuffled permutation)
-    #   - Partner cam_b: drawn from the top-3 FURTHEST cameras from cam_a;
-    #     picking from top-3 (not always #1) avoids all views collapsing to
-    #     the same extreme pair, maximising angular diversity.
-    #   - Interpolation t: uniform in [0.15, 0.85] so synthetic poses
-    #     sample varied positions between the pair, not just the midpoint.
     centres = torch.stack([c.camera_center for c in train_cams], dim=0)  # [N, 3]
     rng = torch.Generator(device="cpu")
-    rng.manual_seed(iteration)                  # deterministic per fix cycle
+    rng.manual_seed(iteration)
 
     n_sample = min(n_views, len(train_cams))
-    # Shuffle anchors so each synthetic view starts from a different camera
     perm = torch.randperm(len(train_cams), generator=rng).tolist()
-
-    pairs: list[tuple[int, int]] = []
-    t_vals: list[float] = []
     top_k = min(3, len(train_cams) - 1)
 
+    pairs: list = []
+    t_vals: list = []
     for i in range(n_sample):
         a_idx = perm[i % len(perm)]
         dists = torch.norm(centres - centres[a_idx], dim=1)
-        dists[a_idx] = -1.0                                     # exclude self
+        dists[a_idx] = -1.0
         _, topk_idx = torch.topk(dists, top_k)
         b_slot = torch.randint(top_k, (1,), generator=rng).item()
         b_idx = topk_idx[b_slot].item()
-        # t ∈ [0.15, 0.85]
         t = float(torch.rand(1, generator=rng).item() * 0.70 + 0.15)
         pairs.append((a_idx, b_idx))
         t_vals.append(t)
 
     total_steps = 0
-    base_uid = -(iteration * 1000)   # negative UIDs to avoid collision with real cams
+    base_uid = -(iteration * 1000)
 
     for pair_idx, ((idx_a, idx_b), t) in enumerate(zip(pairs, t_vals)):
         cam_a = train_cams[idx_a]
         cam_b = train_cams[idx_b]
         synth_uid = base_uid - pair_idx
 
-        # Build the interpolated novel-view camera
         try:
             synth_cam = _interpolate_camera(cam_a, cam_b, t=t, uid=synth_uid)
         except Exception as exc:
-            print(f"[difix] Camera interpolation failed for pair ({idx_a},{idx_b}): {exc}")
+            print(f"[difix] Camera interpolation failed ({idx_a},{idx_b}): {exc}")
             continue
 
-        # 1. Render at the novel viewpoint (no gradients needed)
+        # Render (no grad)
         with torch.no_grad():
             render_pkg_base = render_func(
                 synth_cam, gaussians, pipe, background,
@@ -247,19 +244,18 @@ def difix_fix_step(
             )
             rendered_base = render_pkg_base["render"]   # [3, H, W] ∈ [0, 1]
 
-        # 2. Difix enhancement (inference only)
+        # Difix enhancement
         with torch.no_grad():
-            rendered_pil = _tensor_to_pil(rendered_base)
             enhanced_pil = difix_pipe(
                 _DIFIX_PROMPT,
-                image=rendered_pil,
+                image=_tensor_to_pil(rendered_base),
                 num_inference_steps=1,
                 timesteps=_DIFIX_TIMESTEPS,
                 guidance_scale=0.0,
             ).images[0]
-            enhanced = _pil_to_tensor(enhanced_pil, device=rendered_base.device)
+            enhanced_gpu = _pil_to_tensor(enhanced_pil, device=rendered_base.device)
 
-        # 3. Gradient update(s) — enhanced image is the pseudo-GT
+        # Immediate gradient update(s)
         for _ in range(n_grad_steps):
             render_pkg_grad = render_func(
                 synth_cam, gaussians, pipe, background,
@@ -268,18 +264,70 @@ def difix_fix_step(
             img   = render_pkg_grad["render"]
             radii = render_pkg_grad["radii"]
 
-            Ll1      = l1_loss(img, enhanced)
-            ssim_val = fused_ssim(img.unsqueeze(0), enhanced.unsqueeze(0))
+            Ll1      = l1_loss(img, enhanced_gpu)
+            ssim_val = fused_ssim(img.unsqueeze(0), enhanced_gpu.unsqueeze(0))
             loss     = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim_val)
             loss.backward()
 
             if gaussians.use_appearance_network:
                 gaussians_optimizer.step()
             else:
-                visible = radii > 0
-                gaussians_optimizer.step(visible, radii.shape[0])
+                gaussians_optimizer.step(radii > 0, radii.shape[0])
             gaussians_optimizer.zero_grad(set_to_none=True)
             total_steps += 1
 
-    print(f"[difix] Fix cycle done. Extra gradient steps: {total_steps}")
+        # Store in pool for later reuse (CPU to avoid holding VRAM)
+        novel_data_pool.append((synth_cam, enhanced_gpu.cpu()))
+        if len(novel_data_pool) > _MAX_POOL_SIZE:
+            # Evict oldest entry
+            novel_data_pool.pop(0)
+
+    print(
+        f"[difix] Fix cycle done. "
+        f"Grad steps: {total_steps}  |  Pool size: {len(novel_data_pool)}"
+    )
     torch.cuda.empty_cache()
+
+
+# ── Phase 2: novel data reuse ─────────────────────────────────────────────────
+
+def difix_novel_step(
+    gaussians,
+    novel_data_pool: List[Tuple],
+    render_func,
+    pipe,
+    gaussians_optimizer,
+    background: torch.Tensor,
+    lambda_dssim: float = 0.2,
+) -> None:
+    """One extra gradient step using a random entry from the novel data pool.
+
+    Called probabilistically (novel_data_lambda ≈ 0.3) every training
+    iteration after the first fix cycle, mirroring the --novel_data_lambda
+    mechanism in Difix3D+'s simple_trainer_difix3d.py.
+    """
+    from utils.loss_utils import l1_loss   # noqa: PLC0415
+    from fused_ssim import fused_ssim      # noqa: PLC0415
+
+    # Random entry from pool
+    idx = torch.randint(len(novel_data_pool), (1,)).item()
+    synth_cam, enhanced_cpu = novel_data_pool[idx]
+    enhanced = enhanced_cpu.to(background.device)
+
+    render_pkg = render_func(
+        synth_cam, gaussians, pipe, background,
+        require_coord=False, require_depth=False,
+    )
+    img   = render_pkg["render"]
+    radii = render_pkg["radii"]
+
+    Ll1      = l1_loss(img, enhanced)
+    ssim_val = fused_ssim(img.unsqueeze(0), enhanced.unsqueeze(0))
+    loss     = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim_val)
+    loss.backward()
+
+    if gaussians.use_appearance_network:
+        gaussians_optimizer.step()
+    else:
+        gaussians_optimizer.step(radii > 0, radii.shape[0])
+    gaussians_optimizer.zero_grad(set_to_none=True)

@@ -6,11 +6,12 @@ Run once at Docker build time:
     python3 /workspace/patch_train_difix.py
 
 Makes three minimal, targeted edits to /workspace/MILo/milo/train.py:
-  1. Adds --difix3d and --difix3d_iters arguments to the argparser.
-  2. Initialises the Difix model and schedules fix iterations at
-     the start of the training() function (before the main loop).
-  3. Calls difix_fix_step() after each optimizer/checkpoint step when
-     the current iteration matches a scheduled fix iteration.
+  1. Adds --difix3d, --difix3d_iters, --difix3d_views, --difix3d_lambda
+     arguments to the argparser.
+  2. Initialises the Difix model, novel data pool, and schedules fix iterations
+     at the start of the training() function (before the main loop).
+  3. Calls difix_fix_step() at scheduled iterations and difix_novel_step()
+     probabilistically at every subsequent iteration (novel data reuse).
 
 All changes are conditional on getattr(args, 'difix3d', False), so the
 default MILo flow is completely unchanged when --difix3d is not passed.
@@ -23,7 +24,7 @@ TRAIN_PY = "/workspace/MILo/milo/train.py"
 with open(TRAIN_PY, "r") as f:
     code = f.read()
 
-# ── Patch 1: argparser — add --difix3d and --difix3d_iters ───────────────────
+# ── Patch 1: argparser — add --difix3d and related args ──────────────────────
 # Inserted right after the existing --wandb_entity argument.
 
 _P1_OLD = (
@@ -49,8 +50,12 @@ _P1_NEW = (
     '        help="Iterations at which to run Difix3D+ fix cycles",\n'
     '    )\n'
     '    parser.add_argument(\n'
-    '        "--difix3d_views", type=int, default=16,\n'
-    '        help="Novel views to generate per Difix3D+ fix cycle (default: 16)",\n'
+    '        "--difix3d_views", type=int, default=48,\n'
+    '        help="Novel views to generate per Difix3D+ fix cycle (default: 48)",\n'
+    '    )\n'
+    '    parser.add_argument(\n'
+    '        "--difix3d_lambda", type=float, default=0.3,\n'
+    '        help="Probability of using a pooled novel view each iteration (default: 0.3)",\n'
     '    )'
 )
 
@@ -73,18 +78,26 @@ _P2_NEW = (
     '    # --- Difix3D+ initialisation (no-op unless --difix3d is set) ---\n'
     '    _difix_pipe = None\n'
     '    _difix_iters_set = set()\n'
+    '    _difix_novel_data = []\n'
+    '    _novel_data_lambda = 0.3\n'
     '    if getattr(args, "difix3d", False):\n'
-    '        from difix_integration import init_difix, difix_fix_step as _difix_fix_step\n'
+    '        from difix_integration import (\n'
+    '            init_difix,\n'
+    '            difix_fix_step as _difix_fix_step,\n'
+    '            difix_novel_step as _difix_novel_step,\n'
+    '        )\n'
     '        _difix_pipe = init_difix("cuda")\n'
     '        _difix_iters_set = set(getattr(args, "difix3d_iters", [9000, 13000, 17000]))\n'
-    '        print(f"[difix] Fix cycles scheduled at: {sorted(_difix_iters_set)}")'
+    '        _novel_data_lambda = getattr(args, "difix3d_lambda", 0.3)\n'
+    '        print(f"[difix] Fix cycles scheduled at: {sorted(_difix_iters_set)}")\n'
+    '        print(f"[difix] Novel data reuse lambda: {_novel_data_lambda}")'
 )
 
 assert _P2_OLD in code, "Patch 2 anchor not found in train.py"
 code = code.replace(_P2_OLD, _P2_NEW, 1)
 print("[patch] 2/3  Difix initialisation block added")
 
-# ── Patch 3: training loop — call fix step at scheduled iterations ────────────
+# ── Patch 3: training loop — fix cycles + novel data reuse ───────────────────
 # Inserted before the memory-cleanup block at the bottom of each iteration.
 # This position is OUTSIDE torch.no_grad() (needed for backward) and runs after
 # the normal optimizer + checkpoint step.
@@ -103,9 +116,21 @@ _P3_NEW = (
     '                difix_pipe=_difix_pipe, render_func=render, pipe=pipe,\n'
     '                gaussians_optimizer=gaussians.optimizer, opt=opt,\n'
     '                background=background, iteration=iteration,\n'
-    '                n_views=getattr(args, "difix3d_views", 16),\n'
+    '                novel_data_pool=_difix_novel_data,\n'
+    '                n_views=getattr(args, "difix3d_views", 48),\n'
     '            )\n'
     '            viewpoint_stack = None  # force viewpoint refresh on next iter\n'
+    '\n'
+    '        # --- Difix3D+ novel data reuse (Phase 2) ---\n'
+    '        if _difix_novel_data and torch.rand(1).item() < _novel_data_lambda:\n'
+    '            _difix_novel_step(\n'
+    '                gaussians=gaussians,\n'
+    '                novel_data_pool=_difix_novel_data,\n'
+    '                render_func=render,\n'
+    '                pipe=pipe,\n'
+    '                gaussians_optimizer=gaussians.optimizer,\n'
+    '                background=background,\n'
+    '            )\n'
     '\n'
     '        if iteration % 100 == 0:\n'
     '            torch.cuda.empty_cache()\n'
@@ -114,7 +139,7 @@ _P3_NEW = (
 
 assert _P3_OLD in code, "Patch 3 anchor not found in train.py"
 code = code.replace(_P3_OLD, _P3_NEW, 1)
-print("[patch] 3/3  Difix fix-cycle call inserted into training loop")
+print("[patch] 3/3  Difix fix-cycle + novel-data-reuse calls inserted")
 
 with open(TRAIN_PY, "w") as f:
     f.write(code)
