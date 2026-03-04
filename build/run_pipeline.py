@@ -93,10 +93,10 @@ RUN_STEPS = ["RECONSTRUCTION", "SEGFORMER"]
 ALL_STEPS = SHARED_STEPS + RUN_STEPS
 
 TARGET_IMAGES = {
-    ("outdoor", "production"): 600,
+    ("outdoor", "production"): 450,
     ("outdoor", "proto"):      150,
     ("outdoor", "yono"):       150,
-    ("outdoor", "dense"):      600,
+    ("outdoor", "dense"):      450,
     ("indoor",  "production"): 300,
     ("indoor",  "proto"):      100,
     ("indoor",  "yono"):       100,
@@ -863,7 +863,7 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
     if init_pcd:
         # Dense MVS init already provides geometric coverage — skip --dense_gaussians
         # to avoid aggressive densification causing OOM with many cameras
-        dense_pts = "300000" if scene == "outdoor" else "100000"
+        dense_pts = "200000" if scene == "outdoor" else "100000"
         cmd.extend(["--init_pcd", init_pcd,
                     "--dense_init_pts", dense_pts])
     else:
@@ -872,8 +872,6 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
 
 
 def _run_gsplat(config, state, output_dir, dry_run):
-    scene = config["scene"]
-    resolution = "4" if scene == "outdoor" else "2"
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
@@ -882,7 +880,6 @@ def _run_gsplat(config, state, output_dir, dry_run):
         image_name(config.get("local", False), "onyx-gsplat"),
         "--scene", "/data",
         "--iterations", "7000",
-        "--resolution", resolution,
     ]
 
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
