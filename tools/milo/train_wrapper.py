@@ -122,7 +122,7 @@ def main():
                              "(injected as sparse/0/points3D.bin before MILo reads it)")
     parser.add_argument("--dense_init_pts", type=int, default=500_000,
                         help="Target point count when subsampling the dense init cloud (default: 500000)")
-    parser.add_argument("--resolution", "-r", type=int, default=None,
+    parser.add_argument("--resolution", type=int, default=None,
                         help="Downscale images by this factor (e.g. 2 = half resolution)")
     args = parser.parse_args()
 
