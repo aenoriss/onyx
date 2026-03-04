@@ -863,8 +863,9 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
     if init_pcd:
         # Dense MVS init already provides geometric coverage — skip --dense_gaussians
         # to avoid aggressive densification causing OOM with many cameras
+        dense_pts = "300000" if scene == "outdoor" else "100000"
         cmd.extend(["--init_pcd", init_pcd,
-                    "--dense_init_pts", "100000"])
+                    "--dense_init_pts", dense_pts])
     else:
         cmd.append("--dense")
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
