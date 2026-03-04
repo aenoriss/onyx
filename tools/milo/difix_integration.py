@@ -160,7 +160,7 @@ def difix_fix_step(
     opt,
     background: torch.Tensor,
     iteration: int,
-    n_views: int = 4,
+    n_views: int = 16,
     n_grad_steps: int = 1,
     lambda_dssim: float = 0.2,
 ) -> None:

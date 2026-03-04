@@ -47,6 +47,10 @@ _P1_NEW = (
     '    parser.add_argument(\n'
     '        "--difix3d_iters", nargs="+", type=int, default=[9000, 13000, 17000],\n'
     '        help="Iterations at which to run Difix3D+ fix cycles",\n'
+    '    )\n'
+    '    parser.add_argument(\n'
+    '        "--difix3d_views", type=int, default=16,\n'
+    '        help="Novel views to generate per Difix3D+ fix cycle (default: 16)",\n'
     '    )'
 )
 
@@ -99,6 +103,7 @@ _P3_NEW = (
     '                difix_pipe=_difix_pipe, render_func=render, pipe=pipe,\n'
     '                gaussians_optimizer=gaussians.optimizer, opt=opt,\n'
     '                background=background, iteration=iteration,\n'
+    '                n_views=getattr(args, "difix3d_views", 16),\n'
     '            )\n'
     '            viewpoint_stack = None  # force viewpoint refresh on next iter\n'
     '\n'

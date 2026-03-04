@@ -127,6 +127,8 @@ def main():
     parser.add_argument("--difix3d", action="store_true",
                         help="Enable Difix3D+ fix cycles within MILo training "
                              "(3 cycles at iters 9000, 13000, 17000 by default)")
+    parser.add_argument("--difix3d_views", type=int, default=16,
+                        help="Novel views per Difix3D+ fix cycle (default: 16)")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -201,7 +203,7 @@ def main():
         if args.resolution:
             cmd.extend(["-r", str(args.resolution)])
         if args.difix3d:
-            cmd.append("--difix3d")
+            cmd.extend(["--difix3d", "--difix3d_views", str(args.difix3d_views)])
 
         # MiLo outputs iteration progress like: "Step: 9900/18000"
         train_patterns = {
