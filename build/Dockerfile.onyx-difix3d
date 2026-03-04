@@ -1,0 +1,62 @@
+# onyx-difix3d: Difix3D+ post-processing for Gaussian Splatting
+# NVIDIA Difix3D+ (CVPR 2025 Oral) — render-fix-retrain loop
+# Trains gsplat from COLMAP data with Difix fixes interleaved every N steps
+# License: NVIDIA non-commercial research only
+#
+# Build: docker build -f build/Dockerfile.onyx-difix3d -t onyx-difix3d:latest .
+# (build context = repo root)
+
+FROM ghcr.io/aenoriss/onyx-base:latest
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ── Difix3D pinned dependencies ──────────────────────────────────────────────
+# diffusers==0.25.1 is REQUIRED — newer versions break FromOriginalVAEMixin import
+# peft==0.9.0, huggingface-hub==0.25.1, transformers==4.38.0 must match
+RUN pip install --no-cache-dir \
+    "diffusers==0.25.1" \
+    "peft==0.9.0" \
+    "huggingface-hub==0.25.1" \
+    "transformers==4.38.0" \
+    wandb \
+    "imageio[ffmpeg]" \
+    einops \
+    lpips \
+    xformers \
+    torchmetrics \
+    "torchmetrics[image]" \
+    plyfile
+
+# ── gsplat + training deps ────────────────────────────────────────────────────
+RUN pip install --no-cache-dir \
+    gsplat \
+    "numpy<2.0.0" \
+    scikit-learn \
+    "tyro>=0.8.8" \
+    viser \
+    "nerfview==0.0.2" \
+    tensorboard \
+    tensorly \
+    pyyaml \
+    matplotlib \
+    opencv-python \
+    pycolmap
+
+# fused-ssim (required by gsplat trainer)
+RUN pip install --no-cache-dir \
+    git+https://github.com/rahul-goel/fused-ssim.git
+
+# ── Clone Difix3D ─────────────────────────────────────────────────────────────
+RUN git clone https://github.com/nv-tlabs/Difix3D.git /workspace/Difix3D
+
+WORKDIR /workspace/Difix3D
+
+# ── Onyx wrapper ─────────────────────────────────────────────────────────────
+COPY tools/difix3d/train_wrapper.py /workspace/train_wrapper.py
+
+# HuggingFace cache — writeable at runtime
+ENV HF_HOME=/tmp/hf_cache
+ENV TRANSFORMERS_CACHE=/tmp/hf_cache
+ENV PYTHONPATH=/workspace/Difix3D/src:/workspace/Difix3D/examples/gsplat
+
+ENTRYPOINT ["python3", "/workspace/train_wrapper.py"]

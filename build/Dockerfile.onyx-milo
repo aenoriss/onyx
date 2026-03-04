@@ -65,14 +65,39 @@ RUN cp tetranerf/utils/extension/tetranerf_cpp_extension.cpython-*.so \
 WORKDIR /workspace/MILo/submodules/nvdiffrast
 RUN pip install --no-build-isolation .
 
+WORKDIR /workspace
+
+# ── Difix3D+ dependencies ─────────────────────────────────────────────────────
+# Pinned versions required by Difix3D+ (newer diffusers breaks FromOriginalVAEMixin)
+# scipy is needed for rotation SLERP in camera interpolation
+RUN pip install --no-cache-dir \
+    "diffusers==0.25.1" \
+    "peft==0.9.0" \
+    "huggingface-hub==0.25.1" \
+    "transformers==4.38.0" \
+    scipy \
+    xformers
+
+# Clone Difix3D repository (provides pipeline_difix.py used by difix_integration.py)
+RUN git clone https://github.com/nv-tlabs/Difix3D.git /workspace/Difix3D
+
 WORKDIR /workspace/MILo
 
-# Copy training wrapper script
-ARG CACHE_BUST=1
+# Copy training wrapper + Difix3D+ integration files
+ARG CACHE_BUST=2
 COPY tools/milo/train_wrapper.py /workspace/train_wrapper.py
+COPY tools/milo/difix_integration.py /workspace/MILo/milo/difix_integration.py
+COPY tools/milo/patch_train_difix.py /workspace/patch_train_difix.py
+
+# Apply Difix3D+ patch to MILo's train.py
+# Adds --difix3d / --difix3d_iters flags; default flow is completely unchanged
+RUN python3 /workspace/patch_train_difix.py
 
 # Pin torch cache to a fixed path so pre-downloaded weights survive HOME=/tmp at runtime
 ENV TORCH_HOME=/workspace/.torch
+
+# HuggingFace model cache (bind-mount a persistent volume for fast Difix startup)
+ENV HF_HOME=/workspace/.hf_cache
 
 # Pre-download LPIPS VGG weights using MILo's own lpipsPyTorch (same code path as training)
 RUN python3 -c "import sys; sys.path.insert(0, '/workspace/MILo'); from milo.lpipsPyTorch import LPIPS; LPIPS(net_type='vgg')"

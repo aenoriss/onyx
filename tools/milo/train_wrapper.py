@@ -124,6 +124,9 @@ def main():
                         help="Target point count when subsampling the dense init cloud (default: 500000)")
     parser.add_argument("--resolution", type=int, default=None,
                         help="Downscale images by this factor (e.g. 2 = half resolution)")
+    parser.add_argument("--difix3d", action="store_true",
+                        help="Enable Difix3D+ fix cycles within MILo training "
+                             "(3 cycles at iters 9000, 13000, 17000 by default)")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -197,6 +200,8 @@ def main():
             cmd.append("--eval")
         if args.resolution:
             cmd.extend(["-r", str(args.resolution)])
+        if args.difix3d:
+            cmd.append("--difix3d")
 
         # MiLo outputs iteration progress like: "Step: 9900/18000"
         train_patterns = {
