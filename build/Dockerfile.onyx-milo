@@ -75,8 +75,10 @@ RUN pip install --no-cache-dir \
     "peft==0.9.0" \
     "huggingface-hub==0.25.1" \
     "transformers==4.38.0" \
-    scipy \
-    xformers
+    scipy
+# Note: xformers intentionally excluded — it overwrites torchvision with an
+# incompatible version, breaking the existing torch 2.5.1 + torchvision build.
+# Difix3D+ runs fine without xformers (attention fallback, inference-only use).
 
 # Clone Difix3D repository (provides pipeline_difix.py used by difix_integration.py)
 RUN git clone https://github.com/nv-tlabs/Difix3D.git /workspace/Difix3D
