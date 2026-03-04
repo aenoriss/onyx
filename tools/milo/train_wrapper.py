@@ -122,6 +122,8 @@ def main():
                              "(injected as sparse/0/points3D.bin before MILo reads it)")
     parser.add_argument("--dense_init_pts", type=int, default=500_000,
                         help="Target point count when subsampling the dense init cloud (default: 500000)")
+    parser.add_argument("--resolution", "-r", type=int, default=None,
+                        help="Downscale images by this factor (e.g. 2 = half resolution)")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -193,6 +195,8 @@ def main():
             cmd.append("--dense_gaussians")
         if args.eval:
             cmd.append("--eval")
+        if args.resolution:
+            cmd.extend(["-r", str(args.resolution)])
 
         # MiLo outputs iteration progress like: "Step: 9900/18000"
         train_patterns = {
