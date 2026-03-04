@@ -860,6 +860,8 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
         "--extract-mesh",
         "--mesh_config", "default",
     ]
+    if scene == "outdoor":
+        cmd.extend(["--resolution", "2"])
     if init_pcd:
         # Dense MVS init already provides geometric coverage — skip --dense_gaussians
         # to avoid aggressive densification causing OOM with many cameras
