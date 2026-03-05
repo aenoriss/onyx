@@ -33,10 +33,57 @@ import torch
 from PIL import Image as PILImage
 
 _DIFIX_PROMPT = "remove degradation"
-_DIFIX_TIMESTEPS = [199]
+# Default tau=400 (timestep=399) for stronger corrections than the paper's tau=200.
+# Paper ablation: tau=200 optimal for mild artifacts, but our novel-view renders
+# mid-training have worse artifacts (holes, floaters) → higher tau helps.
+# Configurable via --difix3d_tau CLI arg.
+_DIFIX_TAU_DEFAULT = 400
 # Maximum entries kept in the novel data pool (oldest evicted beyond this limit).
 # At 800×1200 px, 200 images ≈ 2.3 GB on CPU RAM — acceptable for 32 GB hosts.
 _MAX_POOL_SIZE = 200
+
+
+def compute_difix_schedule(
+    total_iters: int,
+    views_per_cycle: int = 48,
+    start_pct: float = 0.50,
+    end_pct: float = 0.95,
+    target_synthetic_pct: float = 0.23,
+    novel_lambda: float = 0.40,
+) -> List[int]:
+    """Compute fix cycle iterations to match a target synthetic data ratio.
+
+    Matches the official Difix3D+ baseline (~23% synthetic training steps).
+    Schedule adapts to any total_iters value (indoor 18k, outdoor variants, etc.).
+
+    Returns sorted list of iteration numbers for fix cycles.
+    """
+    start_iter = int(total_iters * start_pct)
+    end_iter = int(total_iters * end_pct)
+    reuse_window = total_iters - start_iter
+
+    # Solve for num_cycles:
+    #   total_synth = num_cycles * views_per_cycle + novel_lambda * reuse_window
+    #   target = total_synth / (total_iters + total_synth)
+    #   → total_synth = target * total_iters / (1 - target)
+    total_synth_needed = target_synthetic_pct * total_iters / (1 - target_synthetic_pct)
+    reuse_steps = novel_lambda * reuse_window
+    direct_steps_needed = max(total_synth_needed - reuse_steps, views_per_cycle)
+    num_cycles = max(3, round(direct_steps_needed / views_per_cycle))
+
+    # Space cycles evenly across [start_iter, end_iter]
+    if num_cycles == 1:
+        return [start_iter]
+    spacing = (end_iter - start_iter) / (num_cycles - 1)
+    schedule = [int(start_iter + i * spacing) for i in range(num_cycles)]
+
+    # Actual ratio for logging
+    actual_synth = num_cycles * views_per_cycle + reuse_steps
+    actual_pct = actual_synth / (total_iters + actual_synth) * 100
+    print(f"[difix] Schedule: {num_cycles} cycles × {views_per_cycle} views "
+          f"+ {reuse_steps:.0f} reuse steps = {actual_pct:.1f}% synthetic")
+
+    return schedule
 
 
 # ── Synthetic camera ──────────────────────────────────────────────────────────
@@ -135,11 +182,13 @@ def init_difix(device: str = "cuda"):
 
     from pipeline_difix import DifixPipeline  # noqa: PLC0415
 
-    print("[difix] Loading nvidia/difix_ref …")
-    pipe = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
-    pipe.to(device)
+    print("[difix] Loading nvidia/difix_ref (fp16) …")
+    pipe = DifixPipeline.from_pretrained(
+        "nvidia/difix_ref", trust_remote_code=True, torch_dtype=torch.float16,
+    )
+    # Keep on CPU by default — moved to GPU only during fix cycles to avoid OOM
     pipe.set_progress_bar_config(disable=True)
-    print("[difix] DifixPipeline ready.")
+    print("[difix] DifixPipeline ready (CPU, moved to GPU on demand).")
     return pipe
 
 
@@ -169,10 +218,12 @@ def difix_fix_step(
     opt,
     background: torch.Tensor,
     iteration: int,
-    novel_data_pool: List[Tuple],   # mutable list; (synth_cam, enhanced_cpu) appended here
+    novel_data_pool: List[Tuple],   # mutable list; (synth_cam, enhanced_cpu, weight_cpu) appended
     n_views: int = 48,
     n_grad_steps: int = 1,
+    save_debug_images: bool = True,
     lambda_dssim: float = 0.2,
+    difix_tau: int = _DIFIX_TAU_DEFAULT,
 ) -> None:
     """Run one Difix3D+ fix cycle within MILo training.
 
@@ -191,10 +242,34 @@ def difix_fix_step(
     from utils.loss_utils import l1_loss    # noqa: PLC0415
     from fused_ssim import fused_ssim       # noqa: PLC0415
 
+    difix_timesteps = [difix_tau - 1]  # tau=400 → timestep 399
     print(
         f"[difix] Fix cycle @ iter {iteration} — "
-        f"{n_views} novel views × {n_grad_steps} grad step(s)"
+        f"{n_views} novel views × {n_grad_steps} grad step(s), tau={difix_tau}"
     )
+
+    # Free VRAM before moving Difix pipeline to GPU
+    import gc
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()  # second pass after gc
+    free_gb = torch.cuda.mem_get_info()[0] / 1e9
+    print(f"[difix] VRAM free before Difix load: {free_gb:.1f} GB")
+
+    # Enable memory-efficient attention if available (saves ~1GB during VAE decode)
+    try:
+        difix_pipe.enable_attention_slicing(1)
+    except Exception:
+        pass
+    try:
+        difix_pipe.enable_vae_slicing()
+    except Exception:
+        pass
+
+    # Enforce fp16 during GPU transfer — .to("cuda") alone may upcast to fp32
+    difix_pipe.to(device="cuda", dtype=torch.float16)
+    free_gb = torch.cuda.mem_get_info()[0] / 1e9
+    print(f"[difix] Pipeline on GPU (fp16), VRAM free: {free_gb:.1f} GB")
 
     train_cams = scene.getTrainCameras()
     if len(train_cams) < 2:
@@ -202,6 +277,13 @@ def difix_fix_step(
         return
 
     centres = torch.stack([c.camera_center for c in train_cams], dim=0)  # [N, 3]
+    # Forward vectors: camera looks along -Z in camera space.
+    # WVT[:3,:3] = R^T, so forward_world = -R^T[:, 2] = -WVT[:3, 2]
+    forwards = torch.stack(
+        [-c.world_view_transform[:3, 2] for c in train_cams], dim=0
+    )  # [N, 3]
+    forwards = torch.nn.functional.normalize(forwards, dim=1)
+
     rng = torch.Generator(device="cpu")
     rng.manual_seed(iteration)
 
@@ -211,6 +293,7 @@ def difix_fix_step(
 
     pairs: list = []
     t_vals: list = []
+    nearest_ref_idx: list = []   # index of closest training cam for ref_image
     for i in range(n_sample):
         a_idx = perm[i % len(perm)]
         dists = torch.norm(centres - centres[a_idx], dim=1)
@@ -221,6 +304,20 @@ def difix_fix_step(
         t = float(torch.rand(1, generator=rng).item() * 0.70 + 0.15)
         pairs.append((a_idx, b_idx))
         t_vals.append(t)
+        # Combined direction + position scoring for ref camera selection.
+        # Direction alone can pick cameras far away; position alone fails for
+        # 360 scenes where nearby cameras point in opposite directions.
+        interp_centre = (1.0 - t) * centres[a_idx] + t * centres[b_idx]
+        pos_dists = torch.norm(centres - interp_centre, dim=1)
+        pos_score = 1.0 - pos_dists / (pos_dists.max() + 1e-8)  # [0, 1]
+
+        interp_fwd = (1.0 - t) * forwards[a_idx] + t * forwards[b_idx]
+        interp_fwd = torch.nn.functional.normalize(interp_fwd, dim=0)
+        dir_score = (forwards * interp_fwd.unsqueeze(0)).sum(dim=1)  # [-1, 1]
+
+        # 60% direction, 40% position
+        combined = 0.6 * dir_score + 0.4 * pos_score
+        nearest_ref_idx.append(combined.argmax().item())
 
     total_steps = 0
     base_uid = -(iteration * 1000)
@@ -236,35 +333,79 @@ def difix_fix_step(
             print(f"[difix] Camera interpolation failed ({idx_a},{idx_b}): {exc}")
             continue
 
-        # Render (no grad)
+        # Render novel view (no grad). Convert to PIL immediately to free GPU memory.
         with torch.no_grad():
             render_pkg_base = render_func(
                 synth_cam, gaussians, pipe, background,
                 require_coord=False, require_depth=False,
             )
             rendered_base = render_pkg_base["render"]   # [3, H, W] ∈ [0, 1]
+            render_h, render_w = rendered_base.shape[1], rendered_base.shape[2]
+            base_pil = _tensor_to_pil(rendered_base)
+            del render_pkg_base, rendered_base
 
-        # Difix enhancement
-        with torch.no_grad():
-            enhanced_pil = difix_pipe(
+        # Reclaim VRAM from MILo render intermediates before Difix inference
+        torch.cuda.empty_cache()
+
+        # Downscale to 512px (SD-Turbo's native resolution) to fit in VRAM
+        # and produce best quality output. Upscale back to render size after.
+        _DIFIX_SIZE = 512
+        base_small = base_pil.resize((_DIFIX_SIZE, _DIFIX_SIZE), PILImage.LANCZOS)
+
+        # Use the original training photograph as ref_image (clean, no artifacts).
+        ref_cam = train_cams[nearest_ref_idx[pair_idx]]
+        ref_pil = _tensor_to_pil(ref_cam.original_image)
+        ref_small = ref_pil.resize((_DIFIX_SIZE, _DIFIX_SIZE), PILImage.LANCZOS)
+
+        # Difix enhancement (original photo ref guides texture correction)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+            enhanced_small = difix_pipe(
                 _DIFIX_PROMPT,
-                image=_tensor_to_pil(rendered_base),
+                image=base_small,
+                ref_image=ref_small,
                 num_inference_steps=1,
-                timesteps=_DIFIX_TIMESTEPS,
+                timesteps=difix_timesteps,
                 guidance_scale=0.0,
             ).images[0]
-            enhanced_gpu = _pil_to_tensor(enhanced_pil, device=rendered_base.device)
+            # Upscale back to original render dimensions
+            enhanced_pil = enhanced_small.resize((render_w, render_h), PILImage.LANCZOS)
+            enhanced_gpu = _pil_to_tensor(enhanced_pil, device="cuda")
 
-        # Immediate gradient update(s)
+        # Save debug images (first 4 views per cycle)
+        if save_debug_images and pair_idx < 4:
+            import os
+            debug_dir = f"/data/output/milo/difix_debug/iter_{iteration}"
+            os.makedirs(debug_dir, exist_ok=True)
+            base_pil.save(f"{debug_dir}/view_{pair_idx:02d}_render.jpg")
+            ref_pil.save(f"{debug_dir}/view_{pair_idx:02d}_ref.jpg")
+            enhanced_pil.save(f"{debug_dir}/view_{pair_idx:02d}_enhanced.jpg")
+            if pair_idx == 0:
+                print(f"[difix] Debug images → {debug_dir}")
+
+        # Immediate gradient update(s) with depth-based confidence weighting.
+        # Render with depth to compute per-pixel confidence:
+        #   - Valid depth → well-reconstructed → lower weight on diffusion target
+        #   - No/extreme depth → holes/sparse → higher weight on diffusion target
         for _ in range(n_grad_steps):
             render_pkg_grad = render_func(
                 synth_cam, gaussians, pipe, background,
-                require_coord=False, require_depth=False,
+                require_coord=False, require_depth=True,
             )
             img   = render_pkg_grad["render"]
             radii = render_pkg_grad["radii"]
+            depth = render_pkg_grad.get("expected_depth")  # [1,H,W] or None
 
-            Ll1      = l1_loss(img, enhanced_gpu)
+            # Confidence weight map: trust diffusion more where depth is missing
+            if depth is not None:
+                valid = (depth > 1e-4).float()
+                # Smooth to avoid hard edges
+                weight = 1.0 - torch.nn.functional.avg_pool2d(
+                    valid, kernel_size=11, stride=1, padding=5
+                ) * 0.7  # range [0.3, 1.0]
+            else:
+                weight = 1.0  # fallback: uniform weighting
+
+            Ll1      = (weight * torch.abs(img - enhanced_gpu)).mean()
             ssim_val = fused_ssim(img.unsqueeze(0), enhanced_gpu.unsqueeze(0))
             loss     = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim_val)
             loss.backward()
@@ -277,19 +418,26 @@ def difix_fix_step(
             total_steps += 1
 
         # Store in pool for later reuse (CPU to avoid holding VRAM)
-        novel_data_pool.append((synth_cam, enhanced_gpu.cpu()))
+        # Include weight map for novel_step reuse
+        weight_cpu = weight.cpu() if torch.is_tensor(weight) else None
+        novel_data_pool.append((synth_cam, enhanced_gpu.cpu(), weight_cpu))
         if len(novel_data_pool) > _MAX_POOL_SIZE:
             # Evict oldest entry
             novel_data_pool.pop(0)
 
+    # Move Difix back to CPU to free VRAM for normal training
+    difix_pipe.to("cpu")
+    torch.cuda.empty_cache()
     print(
         f"[difix] Fix cycle done. "
         f"Grad steps: {total_steps}  |  Pool size: {len(novel_data_pool)}"
     )
-    torch.cuda.empty_cache()
 
 
 # ── Phase 2: novel data reuse ─────────────────────────────────────────────────
+
+_novel_step_count = 0   # module-level counter for logging
+
 
 def difix_novel_step(
     gaussians,
@@ -309,10 +457,19 @@ def difix_novel_step(
     from utils.loss_utils import l1_loss   # noqa: PLC0415
     from fused_ssim import fused_ssim      # noqa: PLC0415
 
-    # Random entry from pool
+    global _novel_step_count
+    _novel_step_count += 1
+
+    # Random entry from pool (supports both old 2-tuple and new 3-tuple format)
     idx = torch.randint(len(novel_data_pool), (1,)).item()
-    synth_cam, enhanced_cpu = novel_data_pool[idx]
+    entry = novel_data_pool[idx]
+    if len(entry) == 3:
+        synth_cam, enhanced_cpu, weight_cpu = entry
+    else:
+        synth_cam, enhanced_cpu = entry
+        weight_cpu = None
     enhanced = enhanced_cpu.to(background.device)
+    weight = weight_cpu.to(background.device) if weight_cpu is not None else 1.0
 
     render_pkg = render_func(
         synth_cam, gaussians, pipe, background,
@@ -321,7 +478,7 @@ def difix_novel_step(
     img   = render_pkg["render"]
     radii = render_pkg["radii"]
 
-    Ll1      = l1_loss(img, enhanced)
+    Ll1      = (weight * torch.abs(img - enhanced)).mean()
     ssim_val = fused_ssim(img.unsqueeze(0), enhanced.unsqueeze(0))
     loss     = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim_val)
     loss.backward()
@@ -331,3 +488,8 @@ def difix_novel_step(
     else:
         gaussians_optimizer.step(radii > 0, radii.shape[0])
     gaussians_optimizer.zero_grad(set_to_none=True)
+
+    # Log every 500 calls
+    if _novel_step_count % 500 == 0:
+        print(f"[difix] Novel data reuse: {_novel_step_count} steps so far "
+              f"(pool={len(novel_data_pool)}, loss={loss.item():.4f})")
