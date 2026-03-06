@@ -129,8 +129,12 @@ def main():
                              "(3 cycles at iters 9000, 13000, 17000 by default)")
     parser.add_argument("--difix3d_views", type=int, default=48,
                         help="Novel views per Difix3D+ fix cycle (default: 48)")
-    parser.add_argument("--difix3d_lambda", type=float, default=0.3,
-                        help="Probability of novel data reuse per iteration (default: 0.3)")
+    parser.add_argument("--difix3d_lambda", type=float, default=0.40,
+                        help="Probability of novel data reuse per iteration (default: 0.40)")
+    parser.add_argument("--difix3d_tau", type=int, default=400,
+                        help="Difix noise level tau (default: 400; paper default: 200)")
+    parser.add_argument("--masks", default=None,
+                        help="Path to mask directory for mask-aware training")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -174,6 +178,11 @@ def main():
     print(f"Dense:       {args.dense}")
     print(f"Iterations:  18000 (fixed by configs/fast)")
     print(f"Mesh:        {'Yes' if args.extract_mesh else 'No'}")
+    if args.masks and Path(args.masks).is_dir():
+        n_masks = len([f for f in Path(args.masks).iterdir() if f.suffix == '.png'])
+        print(f"Masks:       {n_masks} (mask-aware training enabled)")
+    else:
+        print(f"Masks:       None (standard training)")
     print("=" * 60)
 
     # ── Pre-place external point cloud (dense init) ───────────
@@ -209,7 +218,10 @@ def main():
                 "--difix3d",
                 "--difix3d_views", str(args.difix3d_views),
                 "--difix3d_lambda", str(args.difix3d_lambda),
+                "--difix3d_tau", str(args.difix3d_tau),
             ])
+        if args.masks:
+            cmd.extend(["--masks", str(args.masks)])
 
         # MiLo outputs iteration progress like: "Step: 9900/18000"
         train_patterns = {

@@ -182,12 +182,8 @@ def training(
         mesh_kick_on = args.mesh_regularization and (iteration >= mesh_config["start_iter"])
         depth_order_kick_on = args.depth_order
         
-        # Use random background when training with masks to prevent sky Gaussians learning consistent color
-        if viewpoint_cam.gt_mask is not None:
-            render_bg = torch.tensor([1.0, 0.0, 1.0], device="cuda")  # Fixed magenta
-        else:
-            render_bg = background
-        
+        render_bg = background
+
         # If depth-normal regularization or mesh-in-the-loop regularization are active,
         # we use the rasterizer compatible with depth and normal rendering.
         if reg_kick_on or mesh_kick_on:
@@ -221,38 +217,12 @@ def training(
         )
         gt_image = viewpoint_cam.original_image.cuda()
 
-        # Track which Gaussians are visible in masked (sky) regions for mask-aware densification
-        if viewpoint_cam.gt_mask is not None:
-            gt_mask_binary = (viewpoint_cam.gt_mask.cuda() > 0.5).float()
-            curr_n = gaussians._xyz.shape[0]
-
-
-
-        
-        # Get mask if available (for sky exclusion)
-        gt_mask = viewpoint_cam.gt_mask
-        if gt_mask is not None:
-            gt_mask = gt_mask.cuda()
-            # Normalize mask to 0-1 if needed
-            if gt_mask.max() > 1:
-                gt_mask = gt_mask / 255.0
-
-        # Rendering loss with mask
+        # Rendering loss
         if args.decoupled_appearance:
             Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
         else:
-            if gt_mask is not None:
-                # Masked L1 loss - only count valid pixels
-                diff = torch.abs(image - gt_image)
-                Ll1 = (diff * gt_mask).sum() / (gt_mask.sum() + 1e-6)
-            else:
-                Ll1 = l1_loss(image, gt_image)
-        
-        if gt_mask is not None:
-            # Skip SSIM for masked training - L1 is properly masked, SSIM over zeros creates bad gradients
-            ssim_value = torch.tensor(1.0, device="cuda")  # Contributes 0 to loss: (1-1)=0
-        else:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            Ll1 = l1_loss(image, gt_image)
+        ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         
         # Depth-Normal Consistency Regularization
@@ -388,9 +358,7 @@ def training(
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and iteration != args.depth_reinit_iter:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    # Mask-aware densification: exclude sky Gaussians (only if masks present)
-                    # For RGB-only training, this block does nothing
-                    gaussians.densify_and_prune_mask(opt.densify_grad_threshold,
+                    gaussians.densify_and_prune(opt.densify_grad_threshold,
                                                     0.005, scene.cameras_extent,
                                                     size_threshold, mask_blur)
                     mask_blur = torch.zeros(gaussians._xyz.shape[0], device='cuda')

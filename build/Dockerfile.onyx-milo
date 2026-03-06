@@ -10,6 +10,10 @@ FROM ghcr.io/aenoriss/onyx-base:latest
 
 ARG DEBIAN_FRONTEND=noninteractive
 
+# Compile CUDA kernels for all common GPU architectures + PTX for forward compat
+# PTX ensures JIT compilation on newer drivers (e.g. 580/CUDA 13.0)
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0+PTX"
+
 # EGL for nvdiffrast + tetra_triangulation build deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender-dev \
@@ -75,7 +79,8 @@ RUN pip install --no-cache-dir \
     "peft==0.9.0" \
     "huggingface-hub==0.25.1" \
     "transformers==4.38.0" \
-    scipy
+    scipy \
+    einops
 # Note: xformers intentionally excluded — it overwrites torchvision with an
 # incompatible version, breaking the existing torch 2.5.1 + torchvision build.
 # Difix3D+ runs fine without xformers (attention fallback, inference-only use).
@@ -85,16 +90,6 @@ RUN git clone https://github.com/nv-tlabs/Difix3D.git /workspace/Difix3D
 
 WORKDIR /workspace/MILo
 
-# Copy training wrapper + Difix3D+ integration files
-ARG CACHE_BUST=3
-COPY tools/milo/train_wrapper.py /workspace/train_wrapper.py
-COPY tools/milo/difix_integration.py /workspace/MILo/milo/difix_integration.py
-COPY tools/milo/patch_train_difix.py /workspace/patch_train_difix.py
-
-# Apply Difix3D+ patch to MILo's train.py
-# Adds --difix3d / --difix3d_iters flags; default flow is completely unchanged
-RUN python3 /workspace/patch_train_difix.py
-
 # Pin torch cache to a fixed path so pre-downloaded weights survive HOME=/tmp at runtime
 ENV TORCH_HOME=/workspace/.torch
 
@@ -103,8 +98,27 @@ ENV HF_HOME=/workspace/.hf_cache
 
 # Pre-download LPIPS VGG weights using MILo's own lpipsPyTorch (same code path as training)
 RUN python3 -c "import sys; sys.path.insert(0, '/workspace/MILo'); from milo.lpipsPyTorch import LPIPS; LPIPS(net_type='vgg')"
-# Make cache world-writable so runtime user (uid:gid from host) can write if needed
-RUN chmod -R 777 /workspace/.torch
+# Pre-download Difix3D+ model (~2 GB fp16) so runtime doesn't need internet
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('nvidia/difix_ref')"
+# Make caches world-writable so runtime user (uid:gid from host) can write if needed
+RUN mkdir -p /workspace/.hf_cache && chmod -R 777 /workspace/.torch /workspace/.hf_cache
+
+# ── Onyx wrapper files (COPY last so heavy layers above stay cached) ─────────
+COPY tools/milo/train_wrapper.py /workspace/train_wrapper.py
+COPY tools/milo/difix_integration.py /workspace/MILo/milo/difix_integration.py
+COPY tools/milo/patch_train_difix.py /workspace/patch_train_difix.py
+
+# Apply Difix3D+ patch to MILo's train.py
+# Adds --difix3d / --difix3d_views flags; default flow is completely unchanged
+RUN python3 /workspace/patch_train_difix.py
+
+# Apply mask-aware training patch (AFTER difix — patches the difix-patched train.py)
+# Adds --masks flag, SSIM zero-error infill, densification suppression
+COPY tools/milo/patch_train_masks.py /workspace/patch_train_masks.py
+RUN python3 /workspace/patch_train_masks.py
+
+# Reduce CUDA memory fragmentation (critical for Difix VAE decode on 24GB GPUs)
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # NVIDIA container capabilities (graphics needed for nvdiffrast rendering)
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics

@@ -216,6 +216,7 @@ def main():
         pass
 
     # ── Compute interval ───────────────────────────────────────
+    smart_select = False
     if args.interval:
         interval = args.interval
         print(f"[INTERVAL] {interval}s (user override)")
@@ -224,12 +225,16 @@ def main():
         if duration is None:
             print("[ERROR] Could not determine video duration")
             sys.exit(1)
-        interval = compute_interval(duration, args.target_images, is_360)
+
+        # Smart selection: over-extract at 2fps, prune after scoring
+        interval = 0.5  # 2fps oversampling
         cameras = CAMERAS_PER_FRAME_360 if is_360 else 1
-        source_frames = max(1, args.target_images // cameras)
-        print(f"[INTERVAL] {interval}s (from {duration:.1f}s video, "
-              f"target {args.target_images} images, "
-              f"{source_frames} source frames × {cameras} cameras)")
+        target_frames = max(1, args.target_images // cameras)
+        oversampled_frames = int(duration / interval)
+        print(f"[SMART] Over-extracting at 2fps ({oversampled_frames} frames), "
+              f"will select best {target_frames} frames "
+              f"(target {args.target_images} images)")
+        smart_select = True
     else:
         interval = 1.0
         print(f"[INTERVAL] {interval}s (default)")
@@ -280,6 +285,22 @@ def main():
     # directory rather than writing images directly to it. Flatten it so that
     # InstantSfM (ins-feat) can find the images with a non-recursive os.listdir.
     flatten_processed_subdir(args.output)
+
+    # ── Smart frame/tile selection ────────────────────────────
+    if smart_select:
+        from frame_selector import score_tiles, select_and_prune
+
+        progress("scoring_tiles", "running", 0, step=1, total_steps=1)
+        print("[SMART] Scoring tiles with SIFT features...")
+        scores = score_tiles(args.output)
+        to_delete = select_and_prune(scores, target_count=args.target_images)
+
+        for path in to_delete:
+            os.remove(path)
+
+        remaining = len(scores) - len(to_delete)
+        print(f"[SMART] Scored {len(scores)} tiles, kept {remaining}, "
+              f"deleted {len(to_delete)} low-quality tiles")
 
     progress("done", "completed", 100, step=1, total_steps=1)
 

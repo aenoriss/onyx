@@ -6,7 +6,7 @@ Run once at Docker build time:
     python3 /workspace/patch_train_difix.py
 
 Makes three minimal, targeted edits to /workspace/MILo/milo/train.py:
-  1. Adds --difix3d, --difix3d_iters, --difix3d_views, --difix3d_lambda
+  1. Adds --difix3d, --difix3d_views, --difix3d_lambda, --difix3d_tau
      arguments to the argparser.
   2. Initialises the Difix model, novel data pool, and schedules fix iterations
      at the start of the training() function (before the main loop).
@@ -46,16 +46,16 @@ _P1_NEW = (
     '        help="Enable Difix3D+ fix cycles within MILo training",\n'
     '    )\n'
     '    parser.add_argument(\n'
-    '        "--difix3d_iters", nargs="+", type=int, default=[9000, 13000, 17000],\n'
-    '        help="Iterations at which to run Difix3D+ fix cycles",\n'
-    '    )\n'
-    '    parser.add_argument(\n'
     '        "--difix3d_views", type=int, default=48,\n'
     '        help="Novel views to generate per Difix3D+ fix cycle (default: 48)",\n'
     '    )\n'
     '    parser.add_argument(\n'
-    '        "--difix3d_lambda", type=float, default=0.3,\n'
-    '        help="Probability of using a pooled novel view each iteration (default: 0.3)",\n'
+    '        "--difix3d_lambda", type=float, default=0.40,\n'
+    '        help="Probability of novel data reuse per iteration (default: 0.40)",\n'
+    '    )\n'
+    '    parser.add_argument(\n'
+    '        "--difix3d_tau", type=int, default=400,\n'
+    '        help="Difix noise level tau (default: 400; paper default: 200)",\n'
     '    )'
 )
 
@@ -79,18 +79,27 @@ _P2_NEW = (
     '    _difix_pipe = None\n'
     '    _difix_iters_set = set()\n'
     '    _difix_novel_data = []\n'
-    '    _novel_data_lambda = 0.3\n'
+    '    _novel_data_lambda = 0.40\n'
     '    if getattr(args, "difix3d", False):\n'
     '        from difix_integration import (\n'
     '            init_difix,\n'
+    '            compute_difix_schedule,\n'
     '            difix_fix_step as _difix_fix_step,\n'
     '            difix_novel_step as _difix_novel_step,\n'
     '        )\n'
     '        _difix_pipe = init_difix("cuda")\n'
-    '        _difix_iters_set = set(getattr(args, "difix3d_iters", [9000, 13000, 17000]))\n'
-    '        _novel_data_lambda = getattr(args, "difix3d_lambda", 0.3)\n'
-    '        print(f"[difix] Fix cycles scheduled at: {sorted(_difix_iters_set)}")\n'
-    '        print(f"[difix] Novel data reuse lambda: {_novel_data_lambda}")'
+    '        _difix_views = getattr(args, "difix3d_views", 48)\n'
+    '        _novel_data_lambda = getattr(args, "difix3d_lambda", 0.40)\n'
+    '        _difix_tau = getattr(args, "difix3d_tau", 400)\n'
+    '        _difix_schedule = compute_difix_schedule(\n'
+    '            total_iters=opt.iterations,\n'
+    '            views_per_cycle=_difix_views,\n'
+    '            novel_lambda=_novel_data_lambda,\n'
+    '        )\n'
+    '        _difix_iters_set = set(_difix_schedule)\n'
+    '        print(f"[difix] Fix cycles at: {sorted(_difix_iters_set)}")\n'
+    '        print(f"[difix] Novel data reuse lambda: {_novel_data_lambda}")\n'
+    '        print(f"[difix] Noise tau: {_difix_tau}")'
 )
 
 assert _P2_OLD in code, "Patch 2 anchor not found in train.py"
@@ -117,7 +126,8 @@ _P3_NEW = (
     '                gaussians_optimizer=gaussians.optimizer, opt=opt,\n'
     '                background=background, iteration=iteration,\n'
     '                novel_data_pool=_difix_novel_data,\n'
-    '                n_views=getattr(args, "difix3d_views", 48),\n'
+    '                n_views=_difix_views,\n'
+    '                difix_tau=_difix_tau,\n'
     '            )\n'
     '            viewpoint_stack = None  # force viewpoint refresh on next iter\n'
     '\n'

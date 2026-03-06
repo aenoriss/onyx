@@ -25,5 +25,6 @@ COPY tools/360Extractor /workspace/360Extractor
 
 # Ingest wrapper with progress tracking
 COPY tools/ingest/wrapper.py /workspace/wrapper.py
+COPY tools/ingest/frame_selector.py /workspace/frame_selector.py
 
 ENTRYPOINT ["python", "/workspace/wrapper.py"]

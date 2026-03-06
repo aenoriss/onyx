@@ -89,7 +89,7 @@ def _setup_windows_console():
 GHCR_REGISTRY = "ghcr.io/aenoriss"
 
 SHARED_STEPS = ["INGEST", "SFM"]
-RUN_STEPS = ["RECONSTRUCTION", "SEGFORMER"]
+RUN_STEPS = ["MASKING", "DENSIFICATION", "RECONSTRUCTION", "SEGFORMER"]
 ALL_STEPS = SHARED_STEPS + RUN_STEPS
 
 TARGET_IMAGES = {
@@ -204,7 +204,7 @@ def get_required_containers(config=None):
     # dense mode also needs openmvs for the densify step
     if mode == "gaussian" and quality == "dense":
         containers.append("onyx-openmvs")
-    if config.get("segment"):
+    if config.get("segment") or config.get("mask_classes"):
         containers.append("onyx-segformer")
     return containers
 
@@ -310,6 +310,9 @@ class PipelineState:
                 "video": config["video"],
                 "input": config["input"],
                 "segment": config.get("segment", False),
+                "mask_classes": config.get("mask_classes"),
+                "difix3d": config.get("difix3d", False),
+                "difix3d_test": config.get("difix3d_test", False),
             },
             "started_at": datetime.now().isoformat(),
             "shared_steps": {
@@ -328,7 +331,9 @@ class PipelineState:
                     "steps": {
                         step: {"status": "pending"}
                         for step in RUN_STEPS
-                        if step != "SEGFORMER" or config.get("segment", False)
+                        if (step != "SEGFORMER" or config.get("segment", False))
+                        and (step != "MASKING" or config.get("mask_classes"))
+                        and (step != "DENSIFICATION" or quality == "dense")
                     },
                 }
             ],
@@ -484,6 +489,7 @@ class PipelineState:
     def add_run(self, mode, quality):
         """Append a new run and make it active."""
         segment = self.data["base_config"].get("segment", False)
+        mask_classes = self.data["base_config"].get("mask_classes")
         run = {
             "mode": mode,
             "quality": quality,
@@ -491,7 +497,9 @@ class PipelineState:
             "steps": {
                 step: {"status": "pending"}
                 for step in RUN_STEPS
-                if step != "SEGFORMER" or segment
+                if (step != "SEGFORMER" or segment)
+                and (step != "MASKING" or mask_classes)
+                and (step != "DENSIFICATION" or quality == "dense")
             },
         }
         self.data["runs"].append(run)
@@ -806,8 +814,14 @@ def step_sfm(config, state, output_dir, dry_run=False):
     run_docker(cmd, "SFM", state, output_dir, dry_run)
 
 
+def step_densification(config, state, output_dir, dry_run=False):
+    """Step: OpenMVS dense point cloud (only for gaussian+dense)."""
+    state.start_step("DENSIFICATION", "onyx-openmvs")
+    _run_openmvs_densify(config, state, output_dir, dry_run)
+
+
 def step_reconstruction(config, state, output_dir, dry_run=False):
-    """Step 3: 3D Reconstruction (branches on mode x quality)."""
+    """Step: 3D Reconstruction (branches on mode x quality)."""
     mode = config["mode"]
     quality = config["quality"]
 
@@ -821,7 +835,6 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
     elif mode == "gaussian" and quality == "yono":
         _run_yonosplat(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "dense":
-        _run_openmvs_densify(config, state, output_dir, dry_run)
         _run_milo(config, state, output_dir, dry_run,
                   init_pcd="/data/output/openmvs/scene_dense.ply")
     elif mode == "photogrammetry":
@@ -832,7 +845,9 @@ def _run_openmvs_densify(config, state, output_dir, dry_run):
     """Run OpenMVS densification only (no mesh), to produce a dense point cloud for MILo."""
     dense_ply = output_dir / "output" / "openmvs" / "scene_dense.ply"
     if dense_ply.exists():
-        print(f"[SKIP] OpenMVS densify — {dense_ply} already exists ({dense_ply.stat().st_size / 1e9:.2f} GB)")
+        size_mb = dense_ply.stat().st_size / 1e6
+        print(f"[SKIP] OpenMVS densify — {dense_ply} already exists ({size_mb:.0f} MB)")
+        state.complete_step("DENSIFICATION")
         return
 
     cmd = [
@@ -843,7 +858,7 @@ def _run_openmvs_densify(config, state, output_dir, dry_run):
         "--data_path", "/data",
         "--densify-only",
     ]
-    run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
+    run_docker(cmd, "DENSIFICATION", state, output_dir, dry_run)
 
 
 def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
@@ -870,6 +885,12 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
                     "--dense_init_pts", dense_pts])
     else:
         cmd.append("--dense")
+    if config.get("difix3d", False):
+        cmd.append("--difix3d")
+        if config.get("difix3d_test", False):
+            cmd.append("--difix3d_test")
+    if config.get("mask_classes"):
+        cmd.extend(["--masks", "/data/masks"])
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
 
@@ -917,6 +938,33 @@ def _run_yonosplat(config, state, output_dir, dry_run):
         "--quality",    config["quality"],
     ]
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
+
+
+def step_masking(config, state, output_dir, dry_run=False):
+    """Step: Generate training masks BEFORE reconstruction (mask-only, no PLY filtering)."""
+    container = "onyx-segformer"
+    state.start_step("MASKING", container)
+
+    masks_dir = output_dir / "masks"
+    if masks_dir.exists() and any(masks_dir.glob("*.png")):
+        print(f"[SKIP] MASKING — {masks_dir} already contains masks")
+        state.complete_step("MASKING")
+        return
+
+    mask_classes = config.get("mask_classes", "person")
+
+    cmd = [
+        "docker", "run", "--rm", "--gpus", "all",
+        *uid_gid_flags(),
+        "-e", "HOME=/tmp",
+        "-v", f"{docker_path(output_dir)}:/data",
+        image_name(config.get("local", False), container),
+        "--input", "/data/images",
+        "--output", "/data/masks",
+        "--classes", mask_classes,
+    ]
+
+    run_docker(cmd, "MASKING", state, output_dir, dry_run)
 
 
 def step_segformer(config, state, output_dir, dry_run=False):
@@ -1124,7 +1172,11 @@ def do_fork(source_dir, mode, quality, dry_run=False):
             print(f"[SKIP] {step} — {reason}")
             continue
 
-        if step == "RECONSTRUCTION":
+        if step == "MASKING":
+            step_masking(config, state, source_dir, dry_run)
+        elif step == "DENSIFICATION":
+            step_densification(config, state, source_dir, dry_run)
+        elif step == "RECONSTRUCTION":
             step_reconstruction(config, state, source_dir, dry_run)
         elif step == "SEGFORMER":
             step_segformer(config, state, source_dir, dry_run)
@@ -1520,8 +1572,15 @@ def parse_args():
                         help="Skip SfM (use existing sparse/)")
 
     # Opt-in steps
+    parser.add_argument("--mask-classes", default=None,
+                        help="Comma-separated classes to mask during training "
+                             "(e.g. 'person' or 'person,car'). Enables MASKING step.")
     parser.add_argument("--segment", action="store_true",
                         help="Run Segformer masking after reconstruction")
+    parser.add_argument("--difix3d", action="store_true",
+                        help="Enable Difix3D+ fix cycles during MILo training")
+    parser.add_argument("--difix3d_test", action="store_true",
+                        help="Quick Difix test cycle at iter 100 (4 views) to validate setup")
 
     return parser.parse_args()
 
@@ -1620,6 +1679,9 @@ def main():
             "input": str(input_path),
             "local": args.local,
             "segment": args.segment,
+            "mask_classes": args.mask_classes,
+            "difix3d": args.difix3d,
+            "difix3d_test": args.difix3d_test,
         }
         if args.interval:
             config["interval_override"] = args.interval
@@ -1666,6 +1728,7 @@ def main():
     step_funcs = {
         "INGEST": step_ingest,
         "SFM": step_sfm,
+        "MASKING": step_masking,
         "RECONSTRUCTION": step_reconstruction,
         "SEGFORMER": step_segformer,
     }

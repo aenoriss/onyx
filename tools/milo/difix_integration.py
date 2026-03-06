@@ -284,6 +284,14 @@ def difix_fix_step(
     )  # [N, 3]
     forwards = torch.nn.functional.normalize(forwards, dim=1)
 
+    # Precompute mask penalty: cameras with masked transients are poor Difix refs
+    mask_penalty = torch.zeros(len(train_cams), device=centres.device)
+    for ci, cam in enumerate(train_cams):
+        gt_mask = getattr(cam, "gt_mask", None)
+        if gt_mask is not None:
+            # Penalty proportional to masked fraction (black=excluded pixels)
+            mask_penalty[ci] = (1.0 - gt_mask.mean().item()) * 2.0
+
     rng = torch.Generator(device="cpu")
     rng.manual_seed(iteration)
 
@@ -315,8 +323,8 @@ def difix_fix_step(
         interp_fwd = torch.nn.functional.normalize(interp_fwd, dim=0)
         dir_score = (forwards * interp_fwd.unsqueeze(0)).sum(dim=1)  # [-1, 1]
 
-        # 60% direction, 40% position
-        combined = 0.6 * dir_score + 0.4 * pos_score
+        # 60% direction, 40% position, penalize masked cameras as refs
+        combined = 0.6 * dir_score + 0.4 * pos_score - mask_penalty
         nearest_ref_idx.append(combined.argmax().item())
 
     total_steps = 0
