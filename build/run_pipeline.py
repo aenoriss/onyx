@@ -333,7 +333,7 @@ class PipelineState:
                         for step in RUN_STEPS
                         if (step != "SEGFORMER" or config.get("segment", False))
                         and (step != "MASKING" or config.get("mask_classes"))
-                        and (step != "DENSIFICATION" or quality == "dense")
+                        and (step != "DENSIFICATION" or config.get("quality") == "dense")
                     },
                 }
             ],
@@ -1729,6 +1729,7 @@ def main():
         "INGEST": step_ingest,
         "SFM": step_sfm,
         "MASKING": step_masking,
+        "DENSIFICATION": step_densification,
         "RECONSTRUCTION": step_reconstruction,
         "SEGFORMER": step_segformer,
     }

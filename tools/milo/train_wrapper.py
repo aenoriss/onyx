@@ -131,8 +131,8 @@ def main():
                         help="Novel views per Difix3D+ fix cycle (default: 48)")
     parser.add_argument("--difix3d_lambda", type=float, default=0.40,
                         help="Probability of novel data reuse per iteration (default: 0.40)")
-    parser.add_argument("--difix3d_tau", type=int, default=400,
-                        help="Difix noise level tau (default: 400; paper default: 200)")
+    parser.add_argument("--difix3d_tau", type=int, default=200,
+                        help="Difix noise level tau (default: 200, paper default)")
     parser.add_argument("--masks", default=None,
                         help="Path to mask directory for mask-aware training")
     args = parser.parse_args()

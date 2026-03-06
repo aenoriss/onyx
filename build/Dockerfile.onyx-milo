@@ -106,6 +106,12 @@ RUN mkdir -p /workspace/.hf_cache && chmod -R 777 /workspace/.torch /workspace/.
 # ── Onyx wrapper files (COPY last so heavy layers above stay cached) ─────────
 COPY tools/milo/train_wrapper.py /workspace/train_wrapper.py
 COPY tools/milo/difix_integration.py /workspace/MILo/milo/difix_integration.py
+
+# Apply lazy image loading patch (BEFORE other patches — modifies cameras.py)
+# Loads training images from disk on demand instead of pre-loading all into RAM
+COPY tools/milo/patch_lazy_images.py /workspace/patch_lazy_images.py
+RUN python3 /workspace/patch_lazy_images.py
+
 COPY tools/milo/patch_train_difix.py /workspace/patch_train_difix.py
 
 # Apply Difix3D+ patch to MILo's train.py
