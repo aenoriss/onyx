@@ -1,9 +1,8 @@
 """Score and select best tiles from over-extracted candidate set.
 
 Uses SIFT feature count to rank tiles by quality and temporal binning
-for uniform coverage. Keeps target × overshoot tiles, expecting SfM
-to reject some. COLMAP's registration is the ground truth — we just
-remove obvious garbage (featureless ceiling/floor/blur) cheaply.
+for uniform coverage. Keeps exactly target_count best tiles, excluding
+featureless views entirely. No overshoot padding.
 """
 
 import cv2
@@ -92,13 +91,12 @@ def select_and_prune(
     target_count: int,
     min_sift: int = 50,
     min_frames_keep: int = 10,
-    sfm_overshoot: float = 1.6,
 ) -> list[str]:
     """Select best tiles and return list of paths TO DELETE.
 
-    Keeps target_count × sfm_overshoot tiles ranked by SIFT quality,
+    Keeps exactly target_count best tiles ranked by SIFT quality,
     with temporal binning for uniform timeline coverage.
-    COLMAP decides which actually register — overshoot compensates.
+    Featureless tiles (< min_sift) are always excluded.
     """
     if not scores:
         return []
@@ -106,11 +104,10 @@ def select_and_prune(
     featureless = [s for s in scores if s.sift_count < min_sift]
     viable = [s for s in scores if s.sift_count >= min_sift]
 
-    keep_budget = int(target_count * sfm_overshoot)
+    keep_budget = target_count
     print(f"[SELECT] {len(viable)} viable, {len(featureless)} featureless "
           f"(< {min_sift} SIFT)")
-    print(f"[SELECT] Budget: {keep_budget} tiles "
-          f"(target {target_count} × {sfm_overshoot}x overshoot)")
+    print(f"[SELECT] Budget: {keep_budget} tiles (target {target_count})")
 
     if not viable:
         return [s.path for s in featureless]
@@ -192,7 +189,6 @@ if __name__ == "__main__":
     parser.add_argument("--dir", required=True, help="Image directory")
     parser.add_argument("--target", type=int, default=300, help="Target tile count")
     parser.add_argument("--min-sift", type=int, default=50, help="Min SIFT features")
-    parser.add_argument("--overshoot", type=float, default=1.6, help="SfM overshoot factor")
     parser.add_argument("--dry-run", action="store_true", help="Don't delete, just report")
     args = parser.parse_args()
 
@@ -213,11 +209,11 @@ if __name__ == "__main__":
 
     to_delete = select_and_prune(
         scores, target_count=args.target,
-        min_sift=args.min_sift, sfm_overshoot=args.overshoot,
+        min_sift=args.min_sift,
     )
     remaining = len(scores) - len(to_delete)
     print(f"\nResult: keep {remaining}, delete {len(to_delete)} "
-          f"(target was {args.target}, budget {int(args.target * args.overshoot)})")
+          f"(target was {args.target})")
 
     if not args.dry_run and to_delete:
         for path in to_delete:

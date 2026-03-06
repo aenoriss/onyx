@@ -42,6 +42,18 @@ RUN sed -i 's/use_opengl=True/use_opengl=False/g' milo/scene/mesh.py
 # Patch for CUDA 12.6 compatibility: add missing #include <cfloat> for FLT_MAX
 RUN sed -i '1i #include <cfloat>' submodules/simple-knn/simple_knn.cu
 
+# Patch radegs backward: guard against B=0 (zero visible Gaussians crashes kernel launch)
+# When a camera sees no Gaussians (e.g. large 360 scenes), num_buckets=0 causes
+# <<<0, 32>>> kernel launch → cudaErrorInvalidConfiguration
+RUN python3 -c "\
+f='submodules/diff-gaussian-rasterization_ms/cuda_rasterizer/backward.cu'; \
+t=open(f).read(); \
+old='PerGaussianRenderCUDA<NUM_CHAFFELS> <<<((B*32) + THREADS - 1) / THREADS,THREADS>>>'; \
+new='if (B > 0) PerGaussianRenderCUDA<NUM_CHAFFELS> <<<((B*32) + THREADS - 1) / THREADS,THREADS>>>'; \
+assert old in t, 'radegs backward patch anchor not found'; \
+open(f,'w').write(t.replace(old,new,1)); \
+print('[patch] radegs backward B=0 guard added')"
+
 # Install Python requirements
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -122,6 +134,10 @@ RUN python3 /workspace/patch_train_difix.py
 # Adds --masks flag, SSIM zero-error infill, densification suppression
 COPY tools/milo/patch_train_masks.py /workspace/patch_train_masks.py
 RUN python3 /workspace/patch_train_masks.py
+
+# Guard against empty mesh in mesh regularization (nvdiffrast crashes on 0 triangles)
+COPY tools/milo/patch_mesh_empty_guard.py /workspace/patch_mesh_empty_guard.py
+RUN python3 /workspace/patch_mesh_empty_guard.py
 
 # Reduce CUDA memory fragmentation (critical for Difix VAE decode on 24GB GPUs)
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

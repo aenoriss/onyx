@@ -51,7 +51,21 @@ def _process_dense_init(init_src, sparse_path, target_pts=500_000):
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
     print(f"[dense_init] After SOR: {len(pcd.points):,} points")
 
-    # Stage 2: Uniform random subsample to target
+    # Stage 2: Percentile-based outlier removal (removes distant floaters)
+    # MVS can produce scattered points far from the scene that cause CUDA kernel
+    # crashes in the tile-based rasterizer (invalid grid dimensions from extreme
+    # screen-space projections). Clip to p99 distance from centroid.
+    _pts = np.asarray(pcd.points)
+    _center = _pts.mean(axis=0)
+    _dists = np.linalg.norm(_pts - _center, axis=1)
+    _clip_thresh = np.percentile(_dists, 99)
+    _inlier_mask = _dists <= _clip_thresh
+    _n_clipped = len(_pts) - _inlier_mask.sum()
+    if _n_clipped > 0:
+        pcd = pcd.select_by_index(np.where(_inlier_mask)[0])
+        print(f"[dense_init] After p99 clip: {len(pcd.points):,} points ({_n_clipped:,} distant outliers removed)")
+
+    # Stage 3: Uniform random subsample to target
     # Voxel-based downsampling is unreliable for surface point clouds (MVS output
     # lies on 2D surfaces, not in 3D volumes), so the volumetric voxel formula
     # produces wildly wrong voxel sizes. Random subsampling guarantees exactly
