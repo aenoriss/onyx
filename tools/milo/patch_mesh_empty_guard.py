@@ -10,11 +10,12 @@ crashes with: RuntimeError: tri must have shape [>0, 3]
 This affects dr.rasterize, dr.interpolate, and dr.antialias — all require
 non-empty faces tensors.
 
-This patch guards at THREE levels:
+This patch guards at FOUR levels:
   1. nvdiff_rasterization() — returns zero tensors for empty faces
   2. MeshRenderer.forward() — returns empty output dict for empty meshes
-     (prevents dr.interpolate/dr.antialias crashes in evaluate_mesh_occupancy)
-  3. compute_mesh_regularization() — early return with zero losses
+  3. ScalableMeshRenderer.forward() — same guard for scalable variant
+     (used by evaluate_mesh_occupancy when use_scalable_renderer=True)
+  4. compute_mesh_regularization() — early return with zero losses
 """
 
 import sys
@@ -99,11 +100,54 @@ _P1B_NEW = (
 assert _P1B_OLD in code, "Patch 1b anchor not found in scene/mesh.py (MeshRenderer.forward)"
 code = code.replace(_P1B_OLD, _P1B_NEW, 1)
 
+# ── Patch 1c: Guard ScalableMeshRenderer.forward ─────────────────────────────
+# Same issue as MeshRenderer but for the scalable variant used by
+# evaluate_mesh_occupancy when use_scalable_renderer=True. Per-view frustum
+# culling can produce 0-face submeshes. Without guard: fragments=None → crash.
+
+_P1C_OLD = (
+    "        n_passes = (mesh.faces.shape[0] + max_triangles_in_batch - 1) // max_triangles_in_batch\n"
+    "        \n"
+    "        fragments = None"
+)
+
+_P1C_NEW = (
+    "        # Guard: empty mesh crashes nvdiffrast (dr.interpolate, dr.antialias)\n"
+    "        if mesh.faces.shape[0] == 0:\n"
+    "            if cameras is None:\n"
+    "                cameras = self.rasterizer.cameras\n"
+    "            if isinstance(cameras, Camera):\n"
+    "                _cam = cameras\n"
+    "            else:\n"
+    "                _cam = cameras[cam_idx]\n"
+    "            _H, _W = _cam.image_height, _cam.image_width\n"
+    "            _dev = mesh.verts.device\n"
+    "            output_pkg = {}\n"
+    "            if return_depth:\n"
+    "                output_pkg['depth'] = torch.zeros(1, _H, _W, 1, device=_dev)\n"
+    "            if mesh.verts_colors is not None:\n"
+    "                output_pkg['rgb'] = torch.zeros(1, _H, _W, 3, device=_dev)\n"
+    "            if return_normals:\n"
+    "                output_pkg['normals'] = torch.zeros(1, _H, _W, 3, device=_dev)\n"
+    "            if return_pix_to_face:\n"
+    "                output_pkg['pix_to_face'] = torch.full((1, _H, _W, 1), -1, dtype=torch.long, device=_dev)\n"
+    "            output_pkg['fragments'] = None\n"
+    "            output_pkg['rast_out'] = None\n"
+    "            return output_pkg\n"
+    "        n_passes = (mesh.faces.shape[0] + max_triangles_in_batch - 1) // max_triangles_in_batch\n"
+    "        \n"
+    "        fragments = None"
+)
+
+assert _P1C_OLD in code, "Patch 1c anchor not found in scene/mesh.py (ScalableMeshRenderer.forward)"
+code = code.replace(_P1C_OLD, _P1C_NEW, 1)
+
 with open(MESH_PY, "w") as f:
     f.write(code)
 
-print("[patch-mesh-guard] 1/3  scene/mesh.py — nvdiff_rasterization empty faces guard")
-print("[patch-mesh-guard] 2/3  scene/mesh.py — MeshRenderer.forward empty mesh guard")
+print("[patch-mesh-guard] 1/4  scene/mesh.py — nvdiff_rasterization empty faces guard")
+print("[patch-mesh-guard] 2/4  scene/mesh.py — MeshRenderer.forward empty mesh guard")
+print("[patch-mesh-guard] 3/4  scene/mesh.py — ScalableMeshRenderer.forward empty mesh guard")
 
 # ── Patch 2: Guard compute_mesh_regularization ────────────────────────────────
 
@@ -154,5 +198,5 @@ reg_code = reg_code.replace(_P2_OLD, _P2_NEW, 1)
 with open(MESH_REG_PY, "w") as f:
     f.write(reg_code)
 
-print("[patch-mesh-guard] 3/3  regularizer/mesh.py — filtered faces early-return")
+print("[patch-mesh-guard] 4/4  regularizer/mesh.py — filtered faces early-return")
 print("\n[patch-mesh-guard] All guards active. Empty meshes handled at all call sites.")
