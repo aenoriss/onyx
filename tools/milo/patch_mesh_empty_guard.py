@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-Patch MILo to handle empty meshes gracefully in nvdiffrast rasterization.
+Patch MILo to handle empty meshes gracefully in nvdiffrast.
 
 Run once at Docker build time (AFTER other patches):
     python3 /workspace/patch_mesh_empty_guard.py
 
-When marching tetrahedra + filtering produces zero triangles, or when
-evaluate_mesh_occupancy renders a mesh that has no visible faces for a camera,
-nvdiffrast crashes with: RuntimeError: tri must have shape [>0, 3]
+When marching tetrahedra + filtering produces zero triangles, nvdiffrast
+crashes with: RuntimeError: tri must have shape [>0, 3]
+This affects dr.rasterize, dr.interpolate, and dr.antialias — all require
+non-empty faces tensors.
 
-This patch guards at TWO levels:
-  1. nvdiff_rasterization() in scene/mesh.py — returns zero tensors when faces
-     tensor is empty. Protects ALL callers (MeshRenderer, ScalableMeshRenderer,
-     evaluate_mesh_occupancy, etc.)
-  2. compute_mesh_regularization() in regularization/regularizer/mesh.py —
-     skips the iteration when filtered faces are empty (avoids downstream
-     rendering and loss computation entirely).
+This patch guards at THREE levels:
+  1. nvdiff_rasterization() — returns zero tensors for empty faces
+  2. MeshRenderer.forward() — returns empty output dict for empty meshes
+     (prevents dr.interpolate/dr.antialias crashes in evaluate_mesh_occupancy)
+  3. compute_mesh_regularization() — early return with zero losses
 """
 
 import sys
 
-# ── Patch 1: Guard nvdiff_rasterization at the source ─────────────────────────
-# This is the lowest-level fix — prevents the crash regardless of caller.
+# ── Patch 1: Guard nvdiff_rasterization ───────────────────────────────────────
 
 MESH_PY = "/workspace/MILo/milo/scene/mesh.py"
 
@@ -60,14 +58,54 @@ _P1_NEW = """\
 assert _P1_OLD in code, "Patch 1 anchor not found in scene/mesh.py"
 code = code.replace(_P1_OLD, _P1_NEW, 1)
 
+# ── Patch 1b: Guard MeshRenderer.forward ──────────────────────────────────────
+# MeshRenderer.forward calls dr.interpolate and dr.antialias with mesh.faces
+# AFTER rasterization. Even if rasterize returns zeros, these crash on empty faces.
+# Guard at the top of forward() to return empty output immediately.
+
+# Use a minimal anchor that won't break on whitespace differences
+_P1B_OLD = (
+    "        fragments, rast_out, pos = self.rasterizer(mesh, cameras, cam_idx, return_rast_out=True, return_positions=True)\n"
+    "        if cameras is None:\n"
+    "            cameras = self.rasterizer.cameras"
+)
+
+_P1B_NEW = (
+    "        # Guard: empty mesh crashes dr.interpolate and dr.antialias\n"
+    "        if mesh.faces.shape[0] == 0:\n"
+    "            if cameras is None:\n"
+    "                cameras = self.rasterizer.cameras\n"
+    "            if isinstance(cameras, Camera):\n"
+    "                _cam = cameras\n"
+    "            else:\n"
+    "                _cam = cameras[cam_idx]\n"
+    "            _H, _W = _cam.image_height, _cam.image_width\n"
+    "            _dev = mesh.verts.device\n"
+    "            output_pkg = {}\n"
+    "            if return_depth:\n"
+    "                output_pkg['depth'] = torch.zeros(1, _H, _W, 1, device=_dev)\n"
+    "            if mesh.verts_colors is not None:\n"
+    "                output_pkg['rgb'] = torch.zeros(1, _H, _W, 3, device=_dev)\n"
+    "            if return_normals:\n"
+    "                output_pkg['normals'] = torch.zeros(1, _H, _W, 3, device=_dev)\n"
+    "            if return_pix_to_face:\n"
+    "                output_pkg['pix_to_face'] = torch.full((1, _H, _W, 1), -1, dtype=torch.long, device=_dev)\n"
+    "            return output_pkg\n"
+    "        fragments, rast_out, pos = self.rasterizer(mesh, cameras, cam_idx, return_rast_out=True, return_positions=True)\n"
+    "        if cameras is None:\n"
+    "            cameras = self.rasterizer.cameras"
+)
+
+assert _P1B_OLD in code, "Patch 1b anchor not found in scene/mesh.py (MeshRenderer.forward)"
+code = code.replace(_P1B_OLD, _P1B_NEW, 1)
+
 with open(MESH_PY, "w") as f:
     f.write(code)
 
-print("[patch-mesh-guard] 1/2  scene/mesh.py — nvdiff_rasterization empty faces guard added")
+print("[patch-mesh-guard] 1/3  scene/mesh.py — nvdiff_rasterization empty faces guard")
+print("[patch-mesh-guard] 2/3  scene/mesh.py — MeshRenderer.forward empty mesh guard")
 
-# ── Patch 2: Guard compute_mesh_regularization filtered faces ─────────────────
-# Higher-level guard: skip entire mesh reg iteration when filtered faces are empty.
-# Avoids unnecessary rendering + loss computation.
+# ── Patch 2: Guard compute_mesh_regularization ────────────────────────────────
 
 MESH_REG_PY = "/workspace/MILo/milo/regularization/regularizer/mesh.py"
 
@@ -116,5 +154,5 @@ reg_code = reg_code.replace(_P2_OLD, _P2_NEW, 1)
 with open(MESH_REG_PY, "w") as f:
     f.write(reg_code)
 
-print("[patch-mesh-guard] 2/2  regularizer/mesh.py — filtered faces early-return added")
-print("\n[patch-mesh-guard] Both guards active. Empty meshes handled at all call sites.")
+print("[patch-mesh-guard] 3/3  regularizer/mesh.py — filtered faces early-return")
+print("\n[patch-mesh-guard] All guards active. Empty meshes handled at all call sites.")
