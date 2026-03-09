@@ -13,12 +13,17 @@ Usage:
     # Install (pull all container images — run once)
     python run_pipeline.py --install
 
-    # New run (auto-detects 360 video)
+    # New run from video
     python run_pipeline.py \\
         --input video.mp4 --output ./workdir \\
-        --mode gaussian --scene outdoor --quality production
+        --mode gaussian --scene outdoor --quality production --video normal
 
-    # Force 360 mode
+    # New run from images directory (skips ingest)
+    python run_pipeline.py \\
+        --input /path/to/photos/ --output ./workdir \\
+        --mode gaussian --scene indoor --quality production
+
+    # 360 video
     python run_pipeline.py \\
         --input video.mp4 --output ./workdir \\
         --mode gaussian --scene outdoor --quality production --video 360
@@ -309,6 +314,7 @@ class PipelineState:
                 "scene": config["scene"],
                 "video": config["video"],
                 "input": config["input"],
+                "is_images_input": config.get("is_images_input", False),
                 "segment": config.get("segment", False),
                 "mask_classes": config.get("mask_classes"),
                 "difix3d": config.get("difix3d", False),
@@ -734,7 +740,7 @@ def step_ingest(config, state, output_dir, dry_run=False):
         "--input", "/video/input.mp4",
         "--output", "/data/images",
         "--target-images", str(target),
-        "--video-type", config.get("video", "auto"),
+        "--video-type", config.get("video", "normal"),
     ]
 
     # Pass through interval override if user specified one
@@ -751,8 +757,8 @@ def step_ingest(config, state, output_dir, dry_run=False):
             state.data["base_config"]["video"] = detected
             state.save()
             print(f"[DETECTED] Video type: {detected}")
-    elif config.get("video", "auto") == "auto":
-        # Container didn't write type file, default to normal
+    elif not config.get("video"):
+        # No video type set, default to normal
         state.data["base_config"]["video"] = "normal"
         state.save()
 
@@ -878,12 +884,10 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
     if scene == "outdoor":
         cmd.extend(["--resolution", "2"])
     if init_pcd:
-        # Dense MVS init already provides geometric coverage — skip --dense_gaussians
-        # to avoid aggressive densification causing OOM with many cameras
         dense_pts = "200000" if scene == "outdoor" else "100000"
         cmd.extend(["--init_pcd", init_pcd,
                     "--dense_init_pts", dense_pts])
-    else:
+    if config.get("quality") == "dense":
         cmd.append("--dense")
     if config.get("difix3d", False):
         cmd.append("--difix3d")
@@ -1515,7 +1519,7 @@ def parse_args():
     )
 
     # New run arguments
-    parser.add_argument("--input", "-i", help="Input video file path")
+    parser.add_argument("--input", "-i", help="Input video file or images directory")
     parser.add_argument("--output", "-o", help="Working directory (created if missing)")
     parser.add_argument("--mode", choices=["gaussian", "photogrammetry"],
                         help="Reconstruction mode")
@@ -1523,9 +1527,8 @@ def parse_args():
                         help="Scene type")
     parser.add_argument("--quality", choices=["proto", "production", "yono", "dense"],
                         help="Quality level (dense = OpenMVS densify → MILo init; yono = pose-free feed-forward, no SFM)")
-    parser.add_argument("--video", choices=["normal", "360", "auto"],
-                        default="auto",
-                        help="Video type (default: auto-detect)")
+    parser.add_argument("--video", choices=["normal", "360"],
+                        help="Video type (required for video input, ignored for images)")
 
     # Resume
     parser.add_argument("--resume", metavar="WORKDIR",
@@ -1645,7 +1648,7 @@ def main():
             state.reset_from(args.from_step)
 
         print(f"Resuming pipeline [{state.run_id}] from {output_dir}")
-        video_label = config.get('video', 'auto')
+        video_label = config.get('video', 'normal')
         print(f"Config: mode={config['mode']} scene={config['scene']} "
               f"quality={config['quality']} video={video_label}")
 
@@ -1657,16 +1660,36 @@ def main():
                 missing.append(f"--{arg}")
         if missing:
             print(f"Error: Required arguments missing: {', '.join(missing)}")
-            print("For a new run, all 5 parameters are required:")
-            print("  --input, --output, --mode, --scene, --quality")
-            print("  (--video defaults to auto-detect; override with --video 360 or --video normal)")
+            print("Required: --input, --output, --mode, --scene, --quality")
+            print("  --input can be a video file or an images directory")
+            print("  --video normal|360 is required for video input")
             print("To resume: python run_pipeline.py --resume ./workdir")
             sys.exit(1)
 
         input_path = Path(args.input).resolve()
         if not input_path.exists():
-            print(f"Error: Input video not found: {input_path}")
+            print(f"Error: Input not found: {input_path}")
             sys.exit(1)
+
+        # Detect input type: directory of images vs video file
+        is_images_input = input_path.is_dir()
+        img_files = []
+        if is_images_input:
+            IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
+            img_files = [f for f in input_path.iterdir()
+                         if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
+            if not img_files:
+                print(f"Error: No image files found in {input_path}")
+                sys.exit(1)
+            print(f"[IMAGES] Found {len(img_files)} images in {input_path}")
+            if args.video:
+                print("Warning: --video is ignored for images input")
+            vtype = "normal"
+        else:
+            if not args.video:
+                print("Error: --video normal|360 is required for video input")
+                sys.exit(1)
+            vtype = args.video
 
         output_dir = Path(args.output).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1675,8 +1698,9 @@ def main():
             "mode": args.mode,
             "scene": args.scene,
             "quality": args.quality,
-            "video": args.video,
+            "video": vtype,
             "input": str(input_path),
+            "is_images_input": is_images_input,
             "local": args.local,
             "segment": args.segment,
             "mask_classes": args.mask_classes,
@@ -1688,24 +1712,41 @@ def main():
 
         state = PipelineState.create(output_dir, config)
 
-        video_dst = output_dir / "input_video.mp4"
-        if not video_dst.exists():
-            if _WINDOWS:
-                # Symlinks require admin/Developer Mode on Windows — copy instead
-                shutil.copy2(str(input_path), str(video_dst))
-            else:
-                try:
-                    os.symlink(input_path, video_dst)
-                except OSError:
+        if is_images_input:
+            # Copy images into workdir
+            dest = output_dir / "images"
+            dest.mkdir(parents=True, exist_ok=True)
+            imported = 0
+            for f in sorted(img_files):
+                target = dest / f.name
+                if not target.exists():
+                    shutil.copy2(str(f), str(target))
+                    imported += 1
+            print(f"[IMAGES] Copied {imported} images → {dest}")
+
+            # Write .video_type
+            (output_dir / ".video_type").write_text(vtype, encoding="utf-8")
+        else:
+            # Symlink video into workdir
+            video_dst = output_dir / "input_video.mp4"
+            if not video_dst.exists():
+                if _WINDOWS:
                     shutil.copy2(str(input_path), str(video_dst))
+                else:
+                    try:
+                        os.symlink(input_path, video_dst)
+                    except OSError:
+                        shutil.copy2(str(input_path), str(video_dst))
 
         print(f"Starting pipeline [{state.run_id}]")
-        video_label = config.get('video', 'auto')
         print(f"Config: mode={config['mode']} scene={config['scene']} "
-              f"quality={config['quality']} video={video_label}")
+              f"quality={config['quality']} video={vtype}")
         print(f"Output: {output_dir}")
 
     # ── Apply skip shortcuts ──────────────────────────────────
+    if config.get("is_images_input"):
+        if state.step_status("INGEST") != "completed":
+            state.skip_step("INGEST", f"images directory input")
     if args.skip_ingest:
         if state.step_status("INGEST") != "completed":
             state.skip_step("INGEST", "user requested --skip-ingest")
