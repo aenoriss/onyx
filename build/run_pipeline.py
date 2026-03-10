@@ -102,17 +102,17 @@ TARGET_IMAGES = {
     ("outdoor", "proto"):      150,
     ("outdoor", "yono"):       150,
     ("outdoor", "dense"):      450,
-    ("indoor",  "production"): 300,
+    ("indoor",  "production"): 437,
     ("indoor",  "proto"):      100,
     ("indoor",  "yono"):       100,
-    ("indoor",  "dense"):      300,
+    ("indoor",  "dense"):      437,
 }
 
 RECONSTRUCTION_CONTAINER = {
     ("gaussian", "production"):       "onyx-milo",
     ("gaussian", "proto"):            "onyx-gsplat",
     ("gaussian", "yono"):             "onyx-yonosplat",
-    ("gaussian", "dense"):            "onyx-milo",      # OpenMVS densify → MILo
+    ("gaussian", "dense"):            "onyx-gsplat",    # TEMP: gsplat+MCMC instead of MILo
     ("photogrammetry", "production"): "onyx-openmvs",
     ("photogrammetry", "proto"):      "onyx-openmvs",
 }
@@ -732,7 +732,7 @@ def step_ingest(config, state, output_dir, dry_run=False):
     real_video = Path(config["input"]).resolve()
 
     cmd = [
-        "docker", "run", "--rm",
+        "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
         "-v", f"{docker_path(output_dir)}:/data",
         "-v", f"{docker_path(real_video)}:/video/input.mp4:ro",
@@ -841,8 +841,8 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
     elif mode == "gaussian" and quality == "yono":
         _run_yonosplat(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "dense":
-        _run_milo(config, state, output_dir, dry_run,
-                  init_pcd="/data/output/openmvs/scene_dense.ply")
+        _run_gsplat(config, state, output_dir, dry_run,
+                    init_pcd="/data/output/openmvs/scene_dense.ply")
     elif mode == "photogrammetry":
         _run_openmvs(config, state, output_dir, dry_run)
 
@@ -898,7 +898,10 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
 
-def _run_gsplat(config, state, output_dir, dry_run):
+def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
+    quality = config.get("quality", "proto")
+    scene = config.get("scene", "indoor")
+    iterations = "30000" if quality == "dense" else "7000"
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
@@ -906,8 +909,16 @@ def _run_gsplat(config, state, output_dir, dry_run):
         "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), "onyx-gsplat"),
         "--scene", "/data",
-        "--iterations", "7000",
+        "--iterations", iterations,
     ]
+
+    if quality == "dense":
+        cmd.append("--mcmc")
+
+    if init_pcd:
+        dense_pts = "200000" if scene == "outdoor" else "100000"
+        cmd.extend(["--init_pcd", init_pcd,
+                    "--dense_init_pts", dense_pts])
 
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 

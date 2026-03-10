@@ -32,6 +32,53 @@ from pipeline_progress import progress, run_with_progress
 
 EXTRACTOR_SCRIPT = "/workspace/360Extractor/src/main.py"
 CAMERAS_PER_FRAME_360 = 12
+PERSON_CLASS_ID = 0  # COCO class 0 = person
+
+
+def _filter_person_tiles(image_dir, confidence=0.5, min_area_frac=0.05):
+    """Remove tiles where YOLO detects a person occupying significant area.
+
+    Runs YOLO nano on surviving tiles (post smart-select) instead of on all
+    extracted frames. Much faster: ~480 tiles vs ~7800 raw frames.
+    """
+    from ultralytics import YOLO
+
+    model = YOLO("yolov8n-seg.pt")
+
+    files = sorted([
+        os.path.join(image_dir, f) for f in os.listdir(image_dir)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ])
+
+    print(f"[PERSON-FILTER] Scanning {len(files)} tiles for persons...")
+    deleted = 0
+
+    for i, filepath in enumerate(files):
+        results = model(filepath, verbose=False)
+        if not results or not results[0].boxes:
+            continue
+
+        boxes = results[0].boxes
+        img_h, img_w = results[0].orig_shape
+        img_area = img_h * img_w
+
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            if cls_id != PERSON_CLASS_ID or conf < confidence:
+                continue
+            # Check if person occupies significant area
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            box_area = (x2 - x1) * (y2 - y1)
+            if box_area / img_area >= min_area_frac:
+                os.remove(filepath)
+                deleted += 1
+                break
+
+        if (i + 1) % 100 == 0:
+            print(f"[PERSON-FILTER] {i+1}/{len(files)} scanned, {deleted} removed")
+
+    print(f"[PERSON-FILTER] Done: removed {deleted}/{len(files)} tiles with persons")
 
 
 def flatten_processed_subdir(output_dir):
@@ -181,8 +228,8 @@ def main():
     parser.add_argument("--layout", default="colmap",
                         choices=["ring", "cube", "fibonacci", "colmap"],
                         help="Camera layout for 360 mode (default: colmap)")
-    parser.add_argument("--resolution", type=int, default=2048,
-                        help="Output image resolution (default: 2048)")
+    parser.add_argument("--resolution", type=int, default=None,
+                        help="Output tile resolution (default: auto from source, no upsampling)")
     parser.add_argument("--format", default="jpg", choices=["jpg", "png"],
                         help="Output image format (default: jpg)")
     parser.add_argument("--quality", type=int, default=95,
@@ -226,12 +273,14 @@ def main():
             print("[ERROR] Could not determine video duration")
             sys.exit(1)
 
-        # Smart selection: over-extract at 2fps, prune after scoring
-        interval = 0.5  # 2fps oversampling
+        # Smart selection: over-extract at 1fps, prune after scoring
+        # 1fps is industry standard for overextraction (COLMAP, nerfstudio, RealityCapture)
+        # 360 video captures full surroundings per frame, so 1fps provides ample redundancy
+        interval = 1.0  # 1fps oversampling
         cameras = CAMERAS_PER_FRAME_360 if is_360 else 1
         target_frames = max(1, args.target_images // cameras)
         oversampled_frames = int(duration / interval)
-        print(f"[SMART] Over-extracting at 2fps ({oversampled_frames} frames), "
+        print(f"[SMART] Over-extracting at 1fps ({oversampled_frames} frames), "
               f"will select best {target_frames} frames "
               f"(target {args.target_images} images)")
         smart_select = True
@@ -241,13 +290,35 @@ def main():
 
     mode = "360" if is_360 else "standard"
 
+    # ── Auto-calculate tile resolution to avoid upsampling ────
+    # For 90° FOV tiles from equirectangular, optimal = src_width / 4.
+    # Upsampling beyond source density creates fake blur via interpolation.
+    resolution = args.resolution
+    if is_360 and resolution is None:
+        src_w, _ = get_video_dimensions(args.input)
+        if src_w:
+            # 90° FOV = 1/4 of 360° → max useful pixels = src_w / 4
+            native_res = src_w // 4
+            # Round down to nearest multiple of 64 for codec friendliness
+            native_res = (native_res // 64) * 64
+            resolution = native_res
+            print(f"[AUTO-RES] Source {src_w}px → tile {resolution}px "
+                  f"(native for 90° FOV, no upsampling)")
+        else:
+            resolution = 2048
+            print(f"[AUTO-RES] Could not detect source resolution, using {resolution}px")
+    elif resolution is None:
+        resolution = 2048
+
     print(f"\n{'='*60}")
     print(f"Ingest: {mode} extraction")
-    print(f"  Input:    {args.input}")
-    print(f"  Output:   {args.output}")
-    print(f"  Interval: {interval}s")
+    print(f"  Input:      {args.input}")
+    print(f"  Output:     {args.output}")
+    print(f"  Interval:   {interval}s")
+    print(f"  Resolution: {resolution}px")
+    print(f"  Format:     {args.format}")
     if is_360:
-        print(f"  Layout:   {args.layout}")
+        print(f"  Layout:     {args.layout}")
     print(f"{'='*60}\n")
 
     # ── Run extraction ─────────────────────────────────────────
@@ -259,7 +330,7 @@ def main():
         "--output", args.output,
         "--mode", mode,
         "--interval", str(interval),
-        "--resolution", str(args.resolution),
+        "--resolution", str(resolution),
         "--format", args.format,
         "--quality", str(args.quality),
     ]
@@ -301,6 +372,13 @@ def main():
         remaining = len(scores) - len(to_delete)
         print(f"[SMART] Scored {len(scores)} tiles, kept {remaining}, "
               f"deleted {len(to_delete)} low-quality tiles")
+
+    # ── Post-selection person filtering (YOLO nano) ────────────
+    # Run ONLY on surviving tiles (after smart selection pruned to ~1.6x target).
+    # Much faster than running on all extracted frames.
+    if is_360:
+        progress("person_filter", "running", 0, step=1, total_steps=1)
+        _filter_person_tiles(args.output)
 
     progress("done", "completed", 100, step=1, total_steps=1)
 

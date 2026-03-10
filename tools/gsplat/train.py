@@ -24,6 +24,106 @@ from pipeline_progress import progress, run_with_progress
 NS_WORKSPACE = "/tmp/ns_workspace"
 
 
+def _process_dense_init(init_src, sparse_dir, target_pts=100_000):
+    """Subsample a dense PLY cloud and inject it as points3D.bin.
+
+    Replaces the symlinked points3D.bin with a real file containing dense
+    MVS points. Same logic as MILo's train_wrapper._process_dense_init.
+    """
+    import struct
+    import shutil
+    import numpy as np
+
+    try:
+        import open3d as o3d
+    except ImportError:
+        # Fallback: read PLY with trimesh or plyfile
+        import plyfile
+        plydata = plyfile.PlyData.read(init_src)
+        vertex = plydata['vertex']
+        pts = np.column_stack([vertex['x'], vertex['y'], vertex['z']])
+        try:
+            colors = np.column_stack([vertex['red'], vertex['green'], vertex['blue']]).astype(np.float64) / 255.0
+        except ValueError:
+            colors = np.ones((len(pts), 3), dtype=np.float64)
+        print(f"[dense_init] Loaded {len(pts):,} points (plyfile)")
+        # SOR not available without open3d, skip
+        _center = pts.mean(axis=0)
+        _dists = np.linalg.norm(pts - _center, axis=1)
+        _clip = np.percentile(_dists, 99)
+        mask = _dists <= _clip
+        pts, colors = pts[mask], colors[mask]
+        print(f"[dense_init] After p99 clip: {len(pts):,} points")
+        if len(pts) > target_pts:
+            idx = np.random.choice(len(pts), target_pts, replace=False)
+            pts, colors = pts[idx], colors[idx]
+        rgb = (colors * 255).clip(0, 255).astype(np.uint8)
+        print(f"[dense_init] Final count: {len(pts):,} points")
+        _write_points3d_bin(pts, rgb, sparse_dir)
+        return
+
+    print(f"[dense_init] Loading {init_src} ...")
+    pcd = o3d.io.read_point_cloud(str(init_src))
+    print(f"[dense_init] Loaded {len(pcd.points):,} points")
+
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    print(f"[dense_init] After SOR: {len(pcd.points):,} points")
+
+    _pts = np.asarray(pcd.points)
+    _center = _pts.mean(axis=0)
+    _dists = np.linalg.norm(_pts - _center, axis=1)
+    _clip = np.percentile(_dists, 99)
+    _mask = _dists <= _clip
+    _n_clipped = len(_pts) - _mask.sum()
+    if _n_clipped > 0:
+        pcd = pcd.select_by_index(np.where(_mask)[0])
+        print(f"[dense_init] After p99 clip: {len(pcd.points):,} points")
+
+    pts = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors)
+    if len(colors) == 0 or colors.shape[0] != len(pts):
+        colors = np.ones((len(pts), 3), dtype=np.float32)
+    if len(pts) > target_pts:
+        idx = np.random.choice(len(pts), target_pts, replace=False)
+        pts, colors = pts[idx], colors[idx]
+
+    rgb = (colors * 255).clip(0, 255).astype(np.uint8)
+    print(f"[dense_init] Final count: {len(pts):,} points")
+    _write_points3d_bin(pts, rgb, sparse_dir)
+
+
+def _write_points3d_bin(pts, rgb, sparse_dir):
+    """Write COLMAP binary points3D.bin with empty tracks."""
+    import struct
+    import shutil
+
+    bin_path = os.path.join(sparse_dir, "points3D.bin")
+    backup_path = os.path.join(sparse_dir, "points3D.bin.sparse_backup")
+
+    # Remove symlink and backup original if needed
+    if os.path.islink(bin_path):
+        real_path = os.path.realpath(bin_path)
+        os.unlink(bin_path)
+        if not os.path.exists(backup_path):
+            shutil.copy2(real_path, backup_path)
+            print(f"[dense_init] Backed up sparse cloud → {os.path.basename(backup_path)}")
+    elif os.path.exists(bin_path) and not os.path.exists(backup_path):
+        shutil.copy2(bin_path, backup_path)
+        print(f"[dense_init] Backed up sparse cloud → {os.path.basename(backup_path)}")
+
+    with open(bin_path, 'wb') as f:
+        f.write(struct.pack('<Q', len(pts)))
+        for i, (pt, color) in enumerate(zip(pts, rgb)):
+            f.write(struct.pack('<QdddBBBd',
+                i + 1,
+                float(pt[0]), float(pt[1]), float(pt[2]),
+                int(color[0]), int(color[1]), int(color[2]),
+                0.0,
+            ))
+            f.write(struct.pack('<Q', 0))
+    print(f"[dense_init] Written {len(pts):,} dense points → {bin_path}")
+
+
 def setup_nerfstudio_workspace(scene_path):
     """Create ephemeral nerfstudio-compatible layout with symlinks.
 
@@ -82,6 +182,13 @@ def main():
                         help="Resolution scale factor (1=full, 2=half, 4=quarter)")
     parser.add_argument("--eval", action="store_true",
                         help="Enable eval mode (hold out test images)")
+    parser.add_argument("--mcmc", action="store_true",
+                        help="Use MCMC densification strategy instead of ADC")
+    parser.add_argument("--init_pcd", default=None,
+                        help="Path to dense point cloud PLY for initialization "
+                             "(replaces sparse points3D.bin)")
+    parser.add_argument("--dense_init_pts", type=int, default=100_000,
+                        help="Target point count when subsampling dense init cloud")
     args = parser.parse_args()
 
     scene_path = os.path.abspath(args.scene)
@@ -116,11 +223,22 @@ def main():
     print(f"Masks: {num_masks if has_masks else 'None'}")
     print(f"Iterations: {args.iterations}")
     print(f"Resolution: 1/{args.resolution}")
+    print(f"Strategy:  {'MCMC' if args.mcmc else 'ADC (default)'}")
+    if args.init_pcd:
+        print(f"Dense init: {args.init_pcd} (target {args.dense_init_pts:,} pts)")
     print("=" * 50)
 
+    # ── Pre-place external point cloud (dense init) ───────────
+    if args.init_pcd and os.path.exists(args.init_pcd):
+        sparse_dir = os.path.join(ws, "colmap", "sparse", "0")
+        _process_dense_init(args.init_pcd, sparse_dir, args.dense_init_pts)
+    elif args.init_pcd:
+        print(f"Warning: --init_pcd file not found: {args.init_pcd}")
+
     # ── Stage 1: Training ─────────────────────────────────────
+    method = "splatfacto-mcmc" if args.mcmc else "splatfacto"
     cmd = [
-        "ns-train", "splatfacto",
+        "ns-train", method,
         "--output-dir", output_path,
         "--max-num-iterations", str(args.iterations),
         "--vis", "tensorboard",
@@ -128,6 +246,7 @@ def main():
         "--steps-per-eval-image", "0",
         "--steps-per-eval-all-images", "0",
         "--steps-per-save", str(args.iterations),
+        "--pipeline.model.use-bilateral-grid", "True",
         "colmap",
         "--data", ws,
         "--images-path", "colmap/images",
@@ -156,9 +275,9 @@ def main():
     # ── Stage 2: PLY Export ───────────────────────────────────
     progress("ply_export", "running", step=2, total_steps=total_steps)
 
-    config_paths = glob.glob(os.path.join(output_path, "*", "splatfacto", "*", "config.yml"))
+    config_paths = glob.glob(os.path.join(output_path, "*", method, "*", "config.yml"))
     if not config_paths:
-        config_paths = glob.glob(os.path.join(output_path, "splatfacto", "*", "config.yml"))
+        config_paths = glob.glob(os.path.join(output_path, method, "*", "config.yml"))
 
     if not config_paths:
         print("Warning: No config found for PLY export")

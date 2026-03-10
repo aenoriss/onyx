@@ -14,7 +14,8 @@ ENV TORCH_EXTENSIONS_DIR=/opt/torch_extensions
 RUN python -c "from gsplat.cuda._backend import _C; print('gsplat CUDA kernels compiled:', _C)"
 
 # Nerfstudio (has its own COLMAP parser, no pycolmap needed)
-RUN pip install --no-cache-dir nerfstudio
+# plyfile for dense init PLY reading (lightweight, no open3d needed)
+RUN pip install --no-cache-dir nerfstudio plyfile
 
 # Copy training wrapper
 COPY tools/gsplat/train.py /workspace/train.py
