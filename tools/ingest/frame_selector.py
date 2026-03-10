@@ -298,12 +298,19 @@ def select_and_prune(
         print(f"[SELECT] After gap fill: {len(kept_frame_idxs)} frames, "
               f"~{kept_tiles_count} tiles")
 
-    # Collect tiles from kept frames
+    # Collect tiles from kept frames, excluding featureless tiles
     kept_set = set(kept_frame_idxs)
     kept_tiles = set()
+    n_featureless_dropped = 0
     for fidx in kept_set:
         for t in frames[fidx]:
-            kept_tiles.add(t.path)
+            if t.sift_count < min_sift:
+                n_featureless_dropped += 1
+            else:
+                kept_tiles.add(t.path)
+    if n_featureless_dropped:
+        print(f"[SELECT] Dropped {n_featureless_dropped} featureless tiles "
+              f"(< {min_sift} SIFT features)")
 
     # If still over budget, drop lowest-scoring individual tiles
     if len(kept_tiles) > keep_budget:

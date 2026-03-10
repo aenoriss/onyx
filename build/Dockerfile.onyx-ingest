@@ -20,6 +20,9 @@ RUN pip install --no-cache-dir \
     piexif>=1.1.3 \
     PySide6>=6.5.0
 
+# Pre-download YOLO model for --ai-skip (avoids runtime download)
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8n-seg.pt')"
+
 # Copy 360Extractor source
 COPY tools/360Extractor /workspace/360Extractor
 
