@@ -141,7 +141,7 @@ def main():
         "--result_dir", str(output),
         "--max_steps", str(args.steps),
         "--data_factor", str(args.data_factor),
-        "--fix_steps", str(fix_steps),
+        "--fix_steps"] + [str(s) for s in fix_steps] + [
         "--novel_data_lambda", str(args.novel_lambda),
         "--render_traj_path", "interp",
     ]

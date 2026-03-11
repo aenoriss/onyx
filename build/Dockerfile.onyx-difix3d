@@ -5,6 +5,8 @@
 #
 # Build: docker build -f build/Dockerfile.onyx-difix3d -t onyx-difix3d:latest .
 # (build context = repo root)
+# Run:   docker run --rm --gpus all --ipc=host -v ./workdir:/data onyx-difix3d:latest \
+#          --scene /data --init-ply /data/output/splatfacto/ply/splat.ply
 
 FROM ghcr.io/aenoriss/onyx-base:latest
 
@@ -41,16 +43,32 @@ RUN pip install --no-cache-dir \
     pyyaml \
     matplotlib \
     opencv-python \
-    pycolmap
+    "torchmetrics[image]" \
+    tqdm \
+    wandb
 
-# fused-ssim (required by gsplat trainer)
+# pycolmap: DiFix3D uses rmbrualla's fork which provides SceneManager
+# (pip pycolmap >=3.x removed SceneManager, breaking DiFix3D's COLMAP loader)
 RUN pip install --no-cache-dir \
-    git+https://github.com/rahul-goel/fused-ssim.git
+    git+https://github.com/rmbrualla/pycolmap@cc7ea4b7301720ac29287dbe450952511b32125e
+
+# fused-ssim: use pinned commit from DiFix3D requirements
+# (needs torch at build time for CUDA extension, but won't upgrade it)
+RUN pip install --no-cache-dir --no-build-isolation \
+    git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157
+
+# Pre-compile gsplat CUDA kernels at build time (avoids ~10min JIT at first run)
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0+PTX"
+RUN python3 -c "import gsplat; print('gsplat CUDA kernels compiled')"
 
 # ── Clone Difix3D ─────────────────────────────────────────────────────────────
 RUN git clone https://github.com/nv-tlabs/Difix3D.git /workspace/Difix3D
 
 WORKDIR /workspace
+
+# Patch DiFix inference to 512x512 (SD-Turbo native res, avoids OOM on 24GB GPUs)
+COPY tools/difix3d/patch_fix_512.py /workspace/patch_fix_512.py
+RUN python3 /workspace/patch_fix_512.py
 
 # ── Pre-download model weights (no internet needed at runtime) ────────────────
 ENV HF_HOME=/workspace/.hf_cache
@@ -58,8 +76,9 @@ ENV TORCH_HOME=/workspace/.torch
 
 # Pre-download Difix3D+ model (~2 GB fp16)
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('nvidia/difix_ref')"
-# Pre-download LPIPS VGG weights
+# Pre-download LPIPS VGG weights + AlexNet (used by torchmetrics LPIPS)
 RUN python3 -c "import lpips; lpips.LPIPS(net='vgg')"
+RUN python3 -c "import torchvision; torchvision.models.alexnet(pretrained=True)"
 # Make caches world-writable for runtime user
 RUN mkdir -p /workspace/.hf_cache /workspace/.torch && \
     chmod -R 777 /workspace/.hf_cache /workspace/.torch
@@ -67,7 +86,7 @@ RUN mkdir -p /workspace/.hf_cache /workspace/.torch && \
 # ── Onyx wrapper ─────────────────────────────────────────────────────────────
 COPY tools/difix3d/train_wrapper.py /workspace/train_wrapper.py
 
-ENV PYTHONPATH=/workspace/Difix3D/src:/workspace/Difix3D/examples/gsplat
+ENV PYTHONPATH=/workspace/Difix3D/src:/workspace/Difix3D/examples/gsplat:/workspace/Difix3D
 # Reduce CUDA memory fragmentation (critical for Difix VAE decode on 24GB GPUs)
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

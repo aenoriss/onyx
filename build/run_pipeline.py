@@ -931,6 +931,9 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
         cmd.extend(["--init_pcd", init_pcd,
                     "--dense_init_pts", dense_pts])
 
+    if config.get("bilateral_grid", False):
+        cmd.append("--bilateral-grid")
+
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
 
@@ -944,7 +947,7 @@ def _run_difix_refine(config, state, output_dir, dry_run):
         return
 
     cmd = [
-        "docker", "run", "--rm", "--gpus", "all",
+        "docker", "run", "--rm", "--gpus", "all", "--ipc=host",
         *uid_gid_flags(),
         "-e", "HOME=/tmp",
         "-v", f"{docker_path(output_dir)}:/data",
@@ -1631,6 +1634,9 @@ def parse_args():
                         help="Enable Difix3D+ fix cycles during MILo training")
     parser.add_argument("--difix3d_test", action="store_true",
                         help="Quick Difix test cycle at iter 100 (4 views) to validate setup")
+    parser.add_argument("--bilateral-grid", action="store_true",
+                        help="Enable bilateral grid (per-image exposure/WB correction, "
+                             "useful for outdoor/360, can cause shadow artifacts indoors)")
 
     return parser.parse_args()
 
@@ -1764,6 +1770,7 @@ def main():
             "mask_classes": args.mask_classes,
             "difix3d": args.difix3d,
             "difix3d_test": args.difix3d_test,
+            "bilateral_grid": args.bilateral_grid,
         }
         if args.interval:
             config["interval_override"] = args.interval

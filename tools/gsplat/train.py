@@ -189,6 +189,9 @@ def main():
                              "(replaces sparse points3D.bin)")
     parser.add_argument("--dense_init_pts", type=int, default=100_000,
                         help="Target point count when subsampling dense init cloud")
+    parser.add_argument("--bilateral-grid", action="store_true",
+                        help="Enable bilateral grid for per-image exposure/WB correction "
+                             "(useful for outdoor/360, causes shadow artifacts indoors)")
     args = parser.parse_args()
 
     scene_path = os.path.abspath(args.scene)
@@ -256,8 +259,8 @@ def main():
         "--pipeline.model.use-scale-regularization", "True",
         # Quality: tighter max ratio = more uniform Gaussians, fewer needles
         "--pipeline.model.max-gauss-ratio", "5.0",
-        # Quality: per-image exposure/WB correction for 360 tile variation
-        "--pipeline.model.use-bilateral-grid", "True",
+        # Quality: per-image exposure/WB correction (off by default, causes shadow artifacts on ceilings)
+        "--pipeline.model.use-bilateral-grid", str(args.bilateral_grid),
         # Quality: 1M Gaussian cap (2M had 62% pruned at export — diminishing returns)
         "--pipeline.model.max-gs-num", "1000000",
         # Quality: allow densification through 80% of training
