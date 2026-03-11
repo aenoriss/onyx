@@ -35,11 +35,11 @@ CAMERAS_PER_FRAME_360 = 12
 PERSON_CLASS_ID = 0  # COCO class 0 = person
 
 
-def _filter_person_tiles(image_dir, confidence=0.5, min_area_frac=0.05):
-    """Remove tiles where YOLO detects a person occupying significant area.
+def _filter_person_tiles(image_dir, confidence=0.6, min_area_frac=0.0):
+    """Remove tiles where YOLO detects any person.
 
-    Runs YOLO nano on surviving tiles (post smart-select) instead of on all
-    extracted frames. Much faster: ~480 tiles vs ~7800 raw frames.
+    Discards any image with a detected person — masks alone don't fully
+    prevent artifacts from bilateral grid / camera optimizer confusion.
     """
     from ultralytics import YOLO
 

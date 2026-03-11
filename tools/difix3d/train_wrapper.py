@@ -1,21 +1,20 @@
 """
-Difix3D+ wrapper for the Onyx pipeline.
+Difix3D+ post-processing refinement for the Onyx pipeline.
 
-Runs gsplat training with Difix3D+ interleaved fix steps.
-Optionally initializes from an existing MILo/3DGS .ply checkpoint.
+Takes an existing trained splat PLY + COLMAP scene data, and runs DiFix3D+
+interleaved fix cycles to improve quality (especially novel-view synthesis).
 
 Usage (inside container):
-    # From scratch (COLMAP SfM init):
-    python train_wrapper.py --scene /data
+    # Post-processing refinement from gsplat/splatfacto PLY:
+    python train_wrapper.py --scene /data --init-ply /data/output/splatfacto/ply/splat.ply
 
-    # From MILo output (warm-start):
-    python train_wrapper.py --scene /data --init-ply /data/output/milo/point_cloud/iteration_18000/point_cloud.ply
+    # With custom steps and fix interval:
+    python train_wrapper.py --scene /data --init-ply /data/splat.ply --steps 10000 --fix-interval 2000
 """
 
 import argparse
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 
@@ -23,12 +22,12 @@ TRAINER = "/workspace/Difix3D/examples/gsplat/simple_trainer_difix3d.py"
 
 
 def convert_ply_to_ckpt(ply_path: Path, ckpt_path: Path) -> None:
-    """Convert a standard 3DGS .ply (MILo/inria format) to a gsplat .pt checkpoint."""
+    """Convert a standard 3DGS/splatfacto .ply to a gsplat .pt checkpoint."""
     import numpy as np
     import torch
     from plyfile import PlyData
 
-    print(f"[difix_init] Loading MILo splat from {ply_path} ...")
+    print(f"[difix_init] Loading splat from {ply_path} ...")
     plydata = PlyData.read(str(ply_path))
     verts = plydata["vertex"]
     N = len(verts["x"])
@@ -60,9 +59,7 @@ def convert_ply_to_ckpt(ply_path: Path, ckpt_path: Path) -> None:
         dtype=torch.float32,
     ).unsqueeze(1)  # [N, 1, 3]
 
-    # Higher-order SH [N, 15, 3]
-    # inria .ply stores f_rest as [r0..r14, g0..g14, b0..b14] (45 values, degree=3)
-    # gsplat wants [N, 15, 3] where last dim is RGB for each coefficient
+    # Higher-order SH [N, K, 3]
     rest_keys = sorted([k for k in verts.data.dtype.names if k.startswith("f_rest_")],
                        key=lambda k: int(k.split("_")[-1]))
     if rest_keys:
@@ -89,22 +86,25 @@ def convert_ply_to_ckpt(ply_path: Path, ckpt_path: Path) -> None:
     }
 
     torch.save(ckpt, str(ckpt_path))
-    print(f"[difix_init] Saved gsplat checkpoint → {ckpt_path}")
+    print(f"[difix_init] Saved gsplat checkpoint → {ckpt_path} ({N:,} Gaussians)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Difix3D+ wrapper for Onyx pipeline")
+    parser = argparse.ArgumentParser(description="Difix3D+ refinement for Onyx pipeline")
     parser.add_argument("--scene", required=True,
                         help="Path to scene directory (must contain sparse/0/ and images/)")
     parser.add_argument("--output", default=None,
                         help="Output directory (default: scene/output/difix3d)")
     parser.add_argument("--init-ply", default=None,
-                        help="Path to MILo/3DGS .ply to warm-start from "
-                             "(e.g. output/milo/point_cloud/iteration_18000/point_cloud.ply)")
-    parser.add_argument("--steps", type=int, default=30000,
-                        help="Total training steps (default: 30000)")
+                        help="Path to trained splat .ply for warm-start refinement")
+    parser.add_argument("--steps", type=int, default=10000,
+                        help="Total refinement steps (default: 10000)")
+    parser.add_argument("--fix-interval", type=int, default=2000,
+                        help="Run DiFix3D+ fix cycle every N steps (default: 2000)")
     parser.add_argument("--data-factor", type=int, default=1,
                         help="Image downsample factor (default: 1 = full resolution)")
+    parser.add_argument("--novel-lambda", type=float, default=0.3,
+                        help="Probability of novel data reuse per iteration (default: 0.3)")
     args = parser.parse_args()
 
     scene = Path(args.scene).resolve()
@@ -117,18 +117,22 @@ def main():
             print(f"[ERROR] Required path not found: {p}")
             sys.exit(1)
 
-    # Build fix_steps: every 3k steps
-    fix_steps = list(range(3000, args.steps + 1, 3000))
+    # Build fix_steps schedule
+    fix_steps = list(range(args.fix_interval, args.steps + 1, args.fix_interval))
+    if not fix_steps:
+        fix_steps = [args.steps // 2]
 
     print("=" * 60)
-    print("Difix3D+ — Onyx Pipeline")
+    print("Difix3D+ Post-Processing Refinement — Onyx Pipeline")
     print("=" * 60)
-    print(f"Scene:       {scene}")
-    print(f"Output:      {output}")
-    print(f"Steps:       {args.steps}")
-    print(f"Data factor: {args.data_factor}x")
-    print(f"Fix steps:   {fix_steps}")
-    print(f"Init PLY:    {args.init_ply or 'COLMAP SfM (default)'}")
+    print(f"Scene:        {scene}")
+    print(f"Output:       {output}")
+    print(f"Steps:        {args.steps}")
+    print(f"Fix interval: every {args.fix_interval} steps")
+    print(f"Fix schedule: {fix_steps}")
+    print(f"Novel lambda: {args.novel_lambda}")
+    print(f"Data factor:  {args.data_factor}x")
+    print(f"Init PLY:     {args.init_ply or 'COLMAP SfM (default)'}")
     print("=" * 60)
 
     cmd = [
@@ -138,23 +142,96 @@ def main():
         "--max_steps", str(args.steps),
         "--data_factor", str(args.data_factor),
         "--fix_steps", str(fix_steps),
-        "--novel_data_lambda", "0.3",
+        "--novel_data_lambda", str(args.novel_lambda),
         "--render_traj_path", "interp",
     ]
 
-    # Warm-start from MILo .ply
+    # Warm-start from existing PLY
     if args.init_ply:
         ply_path = Path(args.init_ply).resolve()
         if not ply_path.exists():
             print(f"[ERROR] --init-ply not found: {ply_path}")
             sys.exit(1)
-        ckpt_path = output / "milo_init.pt"
+        ckpt_path = output / "init_splat.pt"
         convert_ply_to_ckpt(ply_path, ckpt_path)
         cmd.extend(["--ckpt", str(ckpt_path)])
 
     print(f"Command: {' '.join(cmd)}\n")
     result = subprocess.run(cmd)
+
+    # Export final PLY from the gsplat checkpoint
+    if result.returncode == 0:
+        print("\n[difix] Training complete. Exporting refined PLY...")
+        _export_ply(output, scene)
+
     sys.exit(result.returncode)
+
+
+def _export_ply(output_dir: Path, scene_dir: Path):
+    """Export the final gsplat checkpoint to a standard 3DGS PLY."""
+    import glob
+    import torch
+    import numpy as np
+    from plyfile import PlyData, PlyElement
+
+    # Find latest checkpoint
+    ckpt_files = sorted(glob.glob(str(output_dir / "ckpts" / "*.pt")))
+    if not ckpt_files:
+        print("[difix] No checkpoint found for export")
+        return
+
+    ckpt_path = ckpt_files[-1]
+    print(f"[difix] Loading checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    splats = ckpt["splats"]
+
+    means = splats["means"].numpy()          # [N, 3]
+    scales = splats["scales"].numpy()         # [N, 3]
+    quats = splats["quats"].numpy()           # [N, 4]
+    opacities = splats["opacities"].numpy()   # [N]
+    sh0 = splats["sh0"].numpy()               # [N, 1, 3]
+    shN = splats["shN"].numpy()               # [N, K, 3]
+
+    N = means.shape[0]
+    print(f"[difix] Exporting {N:,} Gaussians")
+
+    # Build structured array
+    props = [
+        ("x", "f4"), ("y", "f4"), ("z", "f4"),
+        ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),
+    ]
+    # Higher-order SH
+    n_rest = shN.shape[1] * 3
+    for i in range(n_rest):
+        props.append((f"f_rest_{i}", "f4"))
+    props.extend([
+        ("opacity", "f4"),
+        ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
+        ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
+    ])
+
+    arr = np.zeros(N, dtype=props)
+    arr["x"], arr["y"], arr["z"] = means[:, 0], means[:, 1], means[:, 2]
+    arr["f_dc_0"] = sh0[:, 0, 0]
+    arr["f_dc_1"] = sh0[:, 0, 1]
+    arr["f_dc_2"] = sh0[:, 0, 2]
+
+    # SH rest: gsplat stores [N, K, 3], PLY wants [r0..rK, g0..gK, b0..bK]
+    if shN.shape[1] > 0:
+        K = shN.shape[1]
+        # [N, K, 3] → [N, 3, K] → flatten to [N, 3*K]
+        rest_flat = shN.transpose(0, 2, 1).reshape(N, -1)
+        for i in range(n_rest):
+            arr[f"f_rest_{i}"] = rest_flat[:, i]
+
+    arr["opacity"] = opacities
+    arr["scale_0"], arr["scale_1"], arr["scale_2"] = scales[:, 0], scales[:, 1], scales[:, 2]
+    arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"] = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
+
+    el = PlyElement.describe(arr, "vertex")
+    out_path = output_dir / "splat_refined.ply"
+    PlyData([el], text=False).write(str(out_path))
+    print(f"[difix] Refined PLY exported → {out_path} ({N:,} Gaussians)")
 
 
 if __name__ == "__main__":

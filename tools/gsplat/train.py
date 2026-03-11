@@ -176,8 +176,8 @@ def main():
                         help="Path to scene directory (containing images/ + sparse/)")
     parser.add_argument("--output", "-o", default=None,
                         help="Output directory (default: scene/output/splatfacto)")
-    parser.add_argument("--iterations", "-i", type=int, default=30000,
-                        help="Number of training iterations (default: 30000)")
+    parser.add_argument("--iterations", "-i", type=int, default=60000,
+                        help="Number of training iterations (default: 60000)")
     parser.add_argument("--resolution", "-r", type=int, default=1,
                         help="Resolution scale factor (1=full, 2=half, 4=quarter)")
     parser.add_argument("--eval", action="store_true",
@@ -224,6 +224,8 @@ def main():
     print(f"Iterations: {args.iterations}")
     print(f"Resolution: 1/{args.resolution}")
     print(f"Strategy:  {'MCMC' if args.mcmc else 'ADC (default)'}")
+    print(f"BilGrid:   Yes")
+    print(f"CamOptim:  SO3xR3")
     if args.init_pcd:
         print(f"Dense init: {args.init_pcd} (target {args.dense_init_pts:,} pts)")
     print("=" * 50)
@@ -246,7 +248,22 @@ def main():
         "--steps-per-eval-image", "0",
         "--steps-per-eval-all-images", "0",
         "--steps-per-save", str(args.iterations),
+        # Quality: lower cull threshold preserves subtle Gaussians (splatfacto-big default)
+        "--pipeline.model.cull-alpha-thresh", "0.005",
+        # Quality: lower densify threshold = more splits = more detail (splatfacto-big default)
+        "--pipeline.model.densify-grad-thresh", "0.0005",
+        # Quality: penalizes elongated spiky Gaussians (PhysGaussian)
+        "--pipeline.model.use-scale-regularization", "True",
+        # Quality: tighter max ratio = more uniform Gaussians, fewer needles
+        "--pipeline.model.max-gauss-ratio", "5.0",
+        # Quality: per-image exposure/WB correction for 360 tile variation
         "--pipeline.model.use-bilateral-grid", "True",
+        # Quality: 1M Gaussian cap (2M had 62% pruned at export — diminishing returns)
+        "--pipeline.model.max-gs-num", "1000000",
+        # Quality: allow densification through 80% of training
+        "--pipeline.model.stop-split-at", "50000",
+        # Quality: learn pose corrections from SfM imprecision
+        "--pipeline.model.camera-optimizer.mode", "SO3xR3",
         "colmap",
         "--data", ws,
         "--images-path", "colmap/images",
@@ -275,9 +292,10 @@ def main():
     # ── Stage 2: PLY Export ───────────────────────────────────
     progress("ply_export", "running", step=2, total_steps=total_steps)
 
-    config_paths = glob.glob(os.path.join(output_path, "*", method, "*", "config.yml"))
+    # nerfstudio stores splatfacto-mcmc output under "splatfacto/" not "splatfacto-mcmc/"
+    config_paths = glob.glob(os.path.join(output_path, "*", "*", "*", "config.yml"))
     if not config_paths:
-        config_paths = glob.glob(os.path.join(output_path, method, "*", "config.yml"))
+        config_paths = glob.glob(os.path.join(output_path, "*", "*", "config.yml"))
 
     if not config_paths:
         print("Warning: No config found for PLY export")

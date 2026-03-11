@@ -1,6 +1,6 @@
-# onyx-difix3d: Difix3D+ post-processing for Gaussian Splatting
+# onyx-difix3d: Difix3D+ post-processing refinement for Gaussian Splatting
 # NVIDIA Difix3D+ (CVPR 2025 Oral) — render-fix-retrain loop
-# Trains gsplat from COLMAP data with Difix fixes interleaved every N steps
+# Takes a trained splat PLY + COLMAP data, runs DiFix3D+ refinement cycles
 # License: NVIDIA non-commercial research only
 #
 # Build: docker build -f build/Dockerfile.onyx-difix3d -t onyx-difix3d:latest .
@@ -10,22 +10,23 @@ FROM ghcr.io/aenoriss/onyx-base:latest
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# ── Difix3D pinned dependencies ──────────────────────────────────────────────
+# ── Difix3D+ pinned dependencies (matching proven MILo config) ────────────────
 # diffusers==0.25.1 is REQUIRED — newer versions break FromOriginalVAEMixin import
-# peft==0.9.0, huggingface-hub==0.25.1, transformers==4.38.0 must match
+# scipy needed for SLERP camera interpolation
 RUN pip install --no-cache-dir \
     "diffusers==0.25.1" \
     "peft==0.9.0" \
     "huggingface-hub==0.25.1" \
     "transformers==4.38.0" \
-    wandb \
-    "imageio[ffmpeg]" \
+    scipy \
     einops \
     lpips \
-    xformers \
-    torchmetrics \
-    "torchmetrics[image]" \
     plyfile
+
+# xformers for memory-efficient attention (saves ~1GB VRAM during DiFix inference)
+# --no-deps prevents overwriting existing torch/torchvision (torch 2.5.1 + cu124)
+RUN pip install --no-cache-dir --no-deps \
+    xformers==0.0.29.post1 --index-url https://download.pytorch.org/whl/cu124
 
 # ── gsplat + training deps ────────────────────────────────────────────────────
 RUN pip install --no-cache-dir \
@@ -49,14 +50,25 @@ RUN pip install --no-cache-dir \
 # ── Clone Difix3D ─────────────────────────────────────────────────────────────
 RUN git clone https://github.com/nv-tlabs/Difix3D.git /workspace/Difix3D
 
-WORKDIR /workspace/Difix3D
+WORKDIR /workspace
+
+# ── Pre-download model weights (no internet needed at runtime) ────────────────
+ENV HF_HOME=/workspace/.hf_cache
+ENV TORCH_HOME=/workspace/.torch
+
+# Pre-download Difix3D+ model (~2 GB fp16)
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('nvidia/difix_ref')"
+# Pre-download LPIPS VGG weights
+RUN python3 -c "import lpips; lpips.LPIPS(net='vgg')"
+# Make caches world-writable for runtime user
+RUN mkdir -p /workspace/.hf_cache /workspace/.torch && \
+    chmod -R 777 /workspace/.hf_cache /workspace/.torch
 
 # ── Onyx wrapper ─────────────────────────────────────────────────────────────
 COPY tools/difix3d/train_wrapper.py /workspace/train_wrapper.py
 
-# HuggingFace cache — writeable at runtime
-ENV HF_HOME=/tmp/hf_cache
-ENV TRANSFORMERS_CACHE=/tmp/hf_cache
 ENV PYTHONPATH=/workspace/Difix3D/src:/workspace/Difix3D/examples/gsplat
+# Reduce CUDA memory fragmentation (critical for Difix VAE decode on 24GB GPUs)
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ENTRYPOINT ["python3", "/workspace/train_wrapper.py"]

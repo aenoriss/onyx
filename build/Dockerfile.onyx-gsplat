@@ -15,7 +15,17 @@ RUN python -c "from gsplat.cuda._backend import _C; print('gsplat CUDA kernels c
 
 # Nerfstudio (has its own COLMAP parser, no pycolmap needed)
 # plyfile for dense init PLY reading (lightweight, no open3d needed)
-RUN pip install --no-cache-dir nerfstudio plyfile
+RUN pip install --no-cache-dir \
+    "nerfstudio @ git+https://github.com/nerfstudio-project/nerfstudio.git@main" \
+    plyfile
+
+# Pre-compile nerfstudio/gsplat CUDA extensions at build time
+# Triggers JIT compilation of any remaining kernels (rasterization backward, etc.)
+# so first container run doesn't pay the ~5 min compilation penalty.
+RUN python -c "\
+from gsplat.cuda._backend import _C; print('gsplat kernels:', _C); \
+from nerfstudio.models.splatfacto import SplatfactoModel; print('splatfacto ready'); \
+"
 
 # Copy training wrapper
 COPY tools/gsplat/train.py /workspace/train.py
