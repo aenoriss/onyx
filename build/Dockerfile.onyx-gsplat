@@ -19,6 +19,21 @@ RUN pip install --no-cache-dir \
     "nerfstudio @ git+https://github.com/nerfstudio-project/nerfstudio.git@main" \
     plyfile
 
+# Depth Anything V2 for monocular depth priors (335M param large encoder)
+RUN pip install --no-cache-dir huggingface_hub && \
+    git clone --depth 1 https://github.com/DepthAnything/Depth-Anything-V2.git /opt/depth_anything_v2
+ENV PYTHONPATH="/opt/depth_anything_v2:${PYTHONPATH}"
+# Pre-download DAv2 weights at build time (no internet needed at runtime)
+RUN python -c "\
+from huggingface_hub import hf_hub_download; \
+hf_hub_download('depth-anything/Depth-Anything-V2-Large', 'depth_anything_v2_vitl.pth', cache_dir='/workspace/checkpoints'); \
+print('DAv2 weights downloaded') \
+"
+
+# Patch splatfacto: add depth supervision loss (Pearson correlation)
+COPY tools/gsplat/patch_splatfacto_depth.py /workspace/patch_splatfacto_depth.py
+RUN python /workspace/patch_splatfacto_depth.py
+
 # Pre-compile nerfstudio/gsplat CUDA extensions at build time
 # Triggers JIT compilation of any remaining kernels (rasterization backward, etc.)
 # so first container run doesn't pay the ~5 min compilation penalty.
@@ -27,13 +42,16 @@ from gsplat.cuda._backend import _C; print('gsplat kernels:', _C); \
 from nerfstudio.models.splatfacto import SplatfactoModel; print('splatfacto ready'); \
 "
 
-# Copy training wrapper
+# Copy training wrapper + depth generation script
 COPY tools/gsplat/train.py /workspace/train.py
+COPY tools/gsplat/generate_depths.py /workspace/generate_depths.py
 
 # Disable torch inductor JIT compilation (avoids ~10 min cold start per container)
 # Falls back to pre-compiled CUDA kernels (gsplat, PyTorch). ~10-20% slower per iteration
 # but eliminates architecture-specific compilation and serverless cold start penalty.
 # Remove this to re-enable inductor if using persistent cache volumes.
 ENV TORCHDYNAMO_DISABLE=1
+# Prevent CUDA memory fragmentation (critical for depth supervision at full res)
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ENTRYPOINT ["python", "/workspace/train.py"]

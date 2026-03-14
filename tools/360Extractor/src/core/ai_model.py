@@ -7,13 +7,13 @@ class AIService:
     """
     Wrapper for YOLOv8 to handle person detection and segmentation.
     """
-    def __init__(self, model_name='yolov8n-seg.pt'):
+    def __init__(self, model_name='yolov8m-seg.pt'):
         """
         Initialize the AI model.
-        
+
         Args:
             model_name (str): Path or name of the YOLO model.
-                              Defaults to 'yolov8n-seg.pt' (Nano Segmentation).
+                              Defaults to 'yolov8m-seg.pt' (Medium Segmentation).
         """
         self.device = 'cpu'
         if torch.backends.mps.is_available():

@@ -38,15 +38,16 @@ class GeometryProcessor:
             views.append(("Down", 0.0, -90.0, 0))
 
         elif layout_mode == 'colmap':
-            # COLMAP overlapping layout: 4 yaw × 3 pitch = 12 views
-            # Matches COLMAP main branch panorama_sfm.py "overlapping" preset:
+            # COLMAP overlapping layout: 4 yaw × 3 pitch + 4 mid-seam = 16 views
+            # Base: COLMAP panorama_sfm.py "overlapping" preset
             #   num_steps_yaw=4, pitches_deg=(-35.0, 0.0, 35.0), fov=90°
             # Positive-pitch rows get a 45° yaw offset (stagger) so that
-            # seams from one row fall in the center of adjacent rows' views,
-            # maximizing cross-row feature matching.
+            # seams from one row fall in the center of adjacent rows' views.
+            # Mid-seam cameras (45°, 135°, 225°, 315° at pitch 0°) fill
+            # horizontal gaps at the equator for denser feature matching.
             base_yaws = [0.0, 90.0, 180.0, 270.0]
             yaw_names = ['Front', 'Right', 'Back', 'Left']
-            # Staggered names for the offset row
+            # Staggered names for the offset rows
             stagger_names = ['FrontRight', 'RightBack', 'BackLeft', 'LeftFront']
             pitches = [('Up', 35.0), ('Mid', 0.0), ('Down', -35.0)]
 
@@ -58,7 +59,14 @@ class GeometryProcessor:
                     yaw = (base_yaw + yaw_offset) % 360.0
                     final_pitch = pitch + pitch_offset
                     views.append((f"{y_name}_{p_name}", yaw, final_pitch, 0))
-            
+
+            # Mid-seam cameras: fill horizontal gaps at the equator
+            seam_yaws = [45.0, 135.0, 225.0, 315.0]
+            seam_names = ['FrontRight', 'RightBack', 'BackLeft', 'LeftFront']
+            for s_name, s_yaw in zip(seam_names, seam_yaws):
+                final_pitch = 0.0 + pitch_offset
+                views.append((f"{s_name}_Mid", s_yaw, final_pitch, 0))
+
         elif layout_mode == 'fibonacci':
             # Fibonacci Sphere layout
             # Use the Golden Section Spiral algorithm to distribute points evenly

@@ -170,6 +170,35 @@ def setup_nerfstudio_workspace(scene_path):
     return NS_WORKSPACE
 
 
+def downscale_images(ws, factor):
+    """Pre-create downscaled images so nerfstudio doesn't prompt interactively.
+
+    nerfstudio looks for {images_path}_{factor}/ (e.g. colmap/images_2/).
+    If missing, it prompts via stdin which fails in non-interactive Docker.
+    """
+    from PIL import Image
+
+    src_dir = os.path.join(ws, "colmap", "images")
+    dst_dir = os.path.join(ws, "colmap", f"images_{factor}")
+
+    if os.path.exists(dst_dir) and len(os.listdir(dst_dir)) > 0:
+        print(f"[DOWNSCALE] Reusing existing images_{factor}/ ({len(os.listdir(dst_dir))} files)")
+        return
+
+    os.makedirs(dst_dir, exist_ok=True)
+    exts = ('.png', '.jpg', '.jpeg')
+    images = sorted(f for f in os.listdir(src_dir) if f.lower().endswith(exts))
+    print(f"[DOWNSCALE] Creating {len(images)} images at 1/{factor} resolution...")
+
+    for fname in images:
+        img = Image.open(os.path.join(src_dir, fname))
+        w, h = img.size
+        img_resized = img.resize((w // factor, h // factor), Image.LANCZOS)
+        img_resized.save(os.path.join(dst_dir, fname))
+
+    print(f"[DOWNSCALE] Done: {dst_dir} ({len(images)} files)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gaussian Splatting training wrapper")
     parser.add_argument("--scene", "-s", required=True,
@@ -192,6 +221,13 @@ def main():
     parser.add_argument("--bilateral-grid", action="store_true",
                         help="Enable bilateral grid for per-image exposure/WB correction "
                              "(useful for outdoor/360, causes shadow artifacts indoors)")
+    parser.add_argument("--depth", action="store_true",
+                        help="Enable depth supervision with Depth Anything V2 priors "
+                             "(constrains Gaussians to surfaces)")
+    parser.add_argument("--depth-weight", type=float, default=0.2,
+                        help="Depth loss weight (default: 0.2)")
+    parser.add_argument("--max-gs-num", type=int, default=None,
+                        help="Maximum number of Gaussians (default: 300K with depth, 1M without)")
     args = parser.parse_args()
 
     scene_path = os.path.abspath(args.scene)
@@ -227,7 +263,8 @@ def main():
     print(f"Iterations: {args.iterations}")
     print(f"Resolution: 1/{args.resolution}")
     print(f"Strategy:  {'MCMC' if args.mcmc else 'ADC (default)'}")
-    print(f"BilGrid:   Yes")
+    print(f"BilGrid:   {'Yes' if args.bilateral_grid else 'No'}")
+    print(f"Depth:     {'DAv2 (weight=' + str(args.depth_weight) + ')' if args.depth else 'No'}")
     print(f"CamOptim:  SO3xR3")
     if args.init_pcd:
         print(f"Dense init: {args.init_pcd} (target {args.dense_init_pts:,} pts)")
@@ -240,6 +277,27 @@ def main():
     elif args.init_pcd:
         print(f"Warning: --init_pcd file not found: {args.init_pcd}")
 
+    # ── Pre-stage: Generate depth maps (DAv2) ────────────────
+    if args.depth:
+        colmap_images = os.path.join(ws, "colmap", "images")
+        depths_dir = os.path.join(ws, "colmap", "depths")
+        if os.path.exists(depths_dir) and len(os.listdir(depths_dir)) > 0:
+            print(f"[DEPTH] Reusing existing depth maps ({len(os.listdir(depths_dir))} files)")
+        else:
+            progress("depth_generation", "running", 0, step=1, total_steps=total_steps + 1)
+            print("[DEPTH] Generating monocular depth priors with Depth Anything V2...")
+            depth_cmd = [
+                "python", "-u", "/workspace/generate_depths.py",
+                "--images", colmap_images,
+                "--output", depths_dir,
+            ]
+            subprocess.run(depth_cmd, check=True)
+        total_steps += 1
+
+    # ── Pre-stage: Downscale images if needed ───────────────
+    if args.resolution > 1:
+        downscale_images(ws, args.resolution)
+
     # ── Stage 1: Training ─────────────────────────────────────
     method = "splatfacto-mcmc" if args.mcmc else "splatfacto"
     cmd = [
@@ -251,22 +309,19 @@ def main():
         "--steps-per-eval-image", "0",
         "--steps-per-eval-all-images", "0",
         "--steps-per-save", str(args.iterations),
-        # Quality: lower cull threshold preserves subtle Gaussians (splatfacto-big default)
-        "--pipeline.model.cull-alpha-thresh", "0.005",
-        # Quality: lower densify threshold = more splits = more detail (splatfacto-big default)
-        "--pipeline.model.densify-grad-thresh", "0.0005",
-        # Quality: penalizes elongated spiky Gaussians (PhysGaussian)
-        "--pipeline.model.use-scale-regularization", "True",
-        # Quality: tighter max ratio = more uniform Gaussians, fewer needles
-        "--pipeline.model.max-gauss-ratio", "5.0",
-        # Quality: per-image exposure/WB correction (off by default, causes shadow artifacts on ceilings)
+        # Recycle semi-transparent ghosts faster (MCMC default 0.005 too conservative for 300+ images)
+        "--pipeline.model.cull-alpha-thresh", "0.03",
+        # Per-image exposure/WB correction (off by default, causes shadow artifacts on ceilings)
         "--pipeline.model.use-bilateral-grid", str(args.bilateral_grid),
-        # Quality: 1M Gaussian cap (2M had 62% pruned at export — diminishing returns)
-        "--pipeline.model.max-gs-num", "1000000",
-        # Quality: allow densification through 80% of training
-        "--pipeline.model.stop-split-at", "50000",
-        # Quality: learn pose corrections from SfM imprecision
+        # Gaussian cap (overridable via --max-gs-num)
+        "--pipeline.model.max-gs-num", str(args.max_gs_num or 1000000),
+        # Learn pose corrections from SfM imprecision
         "--pipeline.model.camera-optimizer.mode", "SO3xR3",
+        # Depth supervision (Depth Anything V2 priors)
+        # Uses native RGB+ED render (depth from same rasterization, zero extra VRAM)
+        # Gradient freeze (DNGaussian) prevents depth from inflating scales
+        "--pipeline.model.depth-loss-mult", str(args.depth_weight if args.depth else 0.0),
+        "--pipeline.model.output-depth-during-training", str(args.depth),
         "colmap",
         "--data", ws,
         "--images-path", "colmap/images",

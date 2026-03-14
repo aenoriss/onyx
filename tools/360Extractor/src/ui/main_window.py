@@ -267,6 +267,7 @@ class MainWindow(QMainWindow):
         self.layout_combo.addItem("Ring", "ring")
         self.layout_combo.addItem("Cube Map", "cube")
         self.layout_combo.addItem("Fibonacci Sphere", "fibonacci")
+        self.layout_combo.addItem("COLMAP (360°)", "colmap")
         self.layout_combo.setFixedWidth(160)
         self.layout_combo.currentIndexChanged.connect(self.on_layout_changed)
         self.layout_combo.installEventFilter(self.scroll_blocker)

@@ -31,7 +31,7 @@ import sys
 from pipeline_progress import progress, run_with_progress
 
 EXTRACTOR_SCRIPT = "/workspace/360Extractor/src/main.py"
-CAMERAS_PER_FRAME_360 = 12
+CAMERAS_PER_FRAME_360 = 16
 PERSON_CLASS_ID = 0  # COCO class 0 = person
 
 
@@ -43,7 +43,7 @@ def _filter_person_tiles(image_dir, confidence=0.6, min_area_frac=0.0):
     """
     from ultralytics import YOLO
 
-    model = YOLO("yolov8n-seg.pt")
+    model = YOLO("yolov8m-seg.pt")
 
     files = sorted([
         os.path.join(image_dir, f) for f in os.listdir(image_dir)

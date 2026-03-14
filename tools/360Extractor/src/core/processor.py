@@ -41,8 +41,8 @@ class ProcessingWorker(QObject):
         
         if needs_ai:
              # Initialize YOLO model
-             # Note: Using 'yolov8n-seg.pt' (nano) for performance.
-             self.ai_service = AIService('yolov8n-seg.pt')
+             # Note: Using 'yolov8m-seg.pt' (medium) for better person detection.
+             self.ai_service = AIService('yolov8m-seg.pt')
 
         self.motion_detector = MotionDetector()
 

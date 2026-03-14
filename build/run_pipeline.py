@@ -105,7 +105,7 @@ TARGET_IMAGES = {
     ("indoor",  "production"): 437,
     ("indoor",  "proto"):      100,
     ("indoor",  "yono"):       100,
-    ("indoor",  "dense"):      437,
+    ("indoor",  "dense"):      400,
 }
 
 RECONSTRUCTION_CONTAINER = {
@@ -203,7 +203,9 @@ def get_required_containers(config=None):
         return ALL_CONTAINERS  # --install: check everything
     mode = config.get("mode", "gaussian")
     quality = config.get("quality", "production")
-    containers = ["onyx-ingest", "onyx-instantsfm"]
+    containers = ["onyx-instantsfm"]
+    if not config.get("is_images_input", False):
+        containers.append("onyx-ingest")
     recon = RECONSTRUCTION_CONTAINER.get((mode, quality))
     if recon:
         containers.append(recon)
@@ -322,6 +324,11 @@ class PipelineState:
                 "mask_classes": config.get("mask_classes"),
                 "difix3d": config.get("difix3d", False),
                 "difix3d_test": config.get("difix3d_test", False),
+                "local": config.get("local", False),
+                "bilateral_grid": config.get("bilateral_grid", False),
+                "depth": config.get("depth", False),
+                "depth_weight": config.get("depth_weight", 0.2),
+                "colmap_mapper": config.get("colmap_mapper", False),
             },
             "started_at": datetime.now().isoformat(),
             "shared_steps": {
@@ -813,14 +820,30 @@ def step_sfm(config, state, output_dir, dry_run=False):
     if not dry_run:
         _ensure_images_flat(output_dir)
 
+    # Mount updated wrapper if colmap-mapper is requested (avoids container rebuild)
+    wrapper_mount = []
+    if config.get("colmap_mapper", False):
+        local_wrapper = os.path.join(os.path.dirname(__file__),
+                                     "..", "tools", "instantsfm", "wrapper.py")
+        if not os.path.exists(local_wrapper):
+            # Fallback: look next to run_pipeline.py on VPS
+            local_wrapper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "wrapper_sfm.py")
+        if os.path.exists(local_wrapper):
+            wrapper_mount = ["-v", f"{os.path.abspath(local_wrapper)}:/workspace/wrapper.py"]
+
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
         "-e", "HOME=/tmp",
         "-v", f"{docker_path(output_dir)}:/data",
+        *wrapper_mount,
         image_name(config.get("local", False), container),
         "--data_path", "/data",
     ]
+
+    if config.get("colmap_mapper", False):
+        cmd.append("--colmap-mapper")
 
     run_docker(cmd, "SFM", state, output_dir, dry_run)
 
@@ -912,11 +935,12 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
 def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
     quality = config.get("quality", "proto")
     scene = config.get("scene", "indoor")
-    iterations = "60000" if quality == "dense" else "7000"
+    iterations = "120000" if quality == "dense" else "7000"
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
         "-e", "HOME=/tmp",
+        "-e", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "-v", f"{docker_path(output_dir)}:/data",
         image_name(config.get("local", False), "onyx-gsplat"),
         "--scene", "/data",
@@ -933,6 +957,11 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
 
     if config.get("bilateral_grid", False):
         cmd.append("--bilateral-grid")
+
+    # Depth supervision: explicit --depth flag, or auto-enabled for dense quality
+    if config.get("depth", False) or quality == "dense":
+        cmd.extend(["--depth", "--depth-weight",
+                     str(config.get("depth_weight", 0.2))])
 
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
@@ -1637,7 +1666,14 @@ def parse_args():
     parser.add_argument("--bilateral-grid", action="store_true",
                         help="Enable bilateral grid (per-image exposure/WB correction, "
                              "useful for outdoor/360, can cause shadow artifacts indoors)")
-
+    parser.add_argument("--depth", action="store_true",
+                        help="Enable depth supervision with Depth Anything V2 priors "
+                             "(constrains Gaussians to surfaces)")
+    parser.add_argument("--depth-weight", type=float, default=0.2,
+                        help="Depth loss weight (default: 0.2)")
+    parser.add_argument("--colmap-mapper", action="store_true",
+                        help="Use COLMAP incremental mapper instead of InstantSfM "
+                             "(better for cubemap/multi-camera data)")
     return parser.parse_args()
 
 
@@ -1771,6 +1807,9 @@ def main():
             "difix3d": args.difix3d,
             "difix3d_test": args.difix3d_test,
             "bilateral_grid": args.bilateral_grid,
+            "depth": args.depth,
+            "depth_weight": args.depth_weight,
+            "colmap_mapper": args.colmap_mapper,
         }
         if args.interval:
             config["interval_override"] = args.interval
