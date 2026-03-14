@@ -2,17 +2,22 @@
 """Build-time patch: Add depth supervision to nerfstudio's splatfacto.
 
 Uses native RGB+ED rendering (depth from same rasterization, zero extra VRAM).
-Pearson correlation depth loss with opacity-frozen gradient (depth gradients
-update positions, scales, and rotations but NOT opacities). This is critical for
-MCMC: depth opacity gradients kill the population, causing scale growth → OOM.
+Per-frame aligned L1 depth loss with gradient-aware weighting and opacity-frozen
+gradient. Optional normal regularization from depth gradients (cosine distance).
+
+Depth alignment: least-squares (a * d_mono + b) ≈ d_rendered per frame, then
+gradient-weighted L1 provides per-pixel signal. Unlike Pearson correlation
+(global stat, diminishing gradient at high r), L1 has constant gradient that
+pulls Gaussians directly to surfaces.
 
 Applied at Docker build time, same pattern as MILo's patch scripts.
 
 Patches:
-  A. SplatfactoModelConfig — depth config fields
-  C. get_loss_dict — Pearson depth loss with means-only gradient freeze
+  A. SplatfactoModelConfig — depth + normal config fields
+  C. get_loss_dict — aligned L1 depth + normal loss, opacity-frozen gradient
   D. get_outputs — VRAM + Gaussian diagnostics (every 500 steps)
-  E. InputDataset — load .npy depth maps from depths/ directory
+  E. InputDataset — store depth path for lazy loading
+  H. FullImageDatamanager — lazy image + depth loading (free RAM after cache)
 """
 
 import re
@@ -59,6 +64,8 @@ def patch_splatfacto_config(src):
     """Decay depth weight to this fraction over depth_decay_steps. 1.0 = no decay."""
     depth_decay_steps: int = 30000
     """Steps over which depth weight decays (from depth_loss_start_step)."""
+    normal_loss_mult: float = 0.0
+    """Normal regularization weight (cosine distance). 0 = disabled. Recommended: 0.01-0.05"""
 '''
 
     src = src[:insert_after] + new_fields + src[insert_after:]
@@ -67,15 +74,20 @@ def patch_splatfacto_config(src):
 
 
 def patch_splatfacto_loss(src):
-    """Patch C: Pearson depth loss with opacity-frozen gradient.
+    """Patch C: Aligned L1 depth loss + normal regularization, opacity-frozen gradient.
+
+    Per-frame least-squares alignment converts monocular depth to rendered depth
+    scale, then gradient-weighted L1 provides per-pixel gradient (constant
+    magnitude, unlike Pearson's diminishing gradient at high correlation).
+
+    Optional normal regularization computes surface normals from rendered and
+    aligned GT depth via finite differences, penalizing cosine distance.
 
     Depth gradients update means, scales, and quats via selective backward.
-    Opacities are frozen — critical for MCMC compatibility: depth gradients
-    on opacities kill the population (200K→12K alive), causing RGB to
-    compensate with larger scales → intersection buffer explosion → OOM.
+    Opacities are frozen — critical for MCMC compatibility.
     """
 
-    # Replace the end of get_loss_dict to add depth loss
+    # Replace the end of get_loss_dict to add depth + normal loss
     anchor = (
         '        if self.training:\n'
         '            # Add loss from camera optimizer\n'
@@ -108,10 +120,11 @@ def patch_splatfacto_loss(src):
         '            if self.config.use_bilateral_grid:\n'
         '                loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)\n'
         '\n'
-        '        # ── Depth supervision (Pearson correlation, means-only gradient freeze) ──\n'
-        '        # Depth gradients only update positions — NOT scales, quats, or opacities.\n'
-        '        # Critical for MCMC: opacity gradients from depth kill the population,\n'
-        '        # causing RGB to grow scales to compensate → intersection buffer OOM.\n'
+        '        # ── Depth supervision (aligned L1, opacity-frozen gradient) ──\n'
+        '        # Per-frame least-squares alignment converts monocular depth to rendered\n'
+        '        # depth scale, then gradient-weighted L1 provides per-pixel signal.\n'
+        '        # Unlike Pearson (global stat, diminishing gradient at high r), L1 has\n'
+        '        # constant gradient magnitude → pulls Gaussians directly to surfaces.\n'
         '        if (self.training\n'
         '                and self.config.depth_loss_mult > 0\n'
         '                and self.step >= self.config.depth_loss_start_step\n'
@@ -135,11 +148,33 @@ def patch_splatfacto_loss(src):
         '            _dg = _depth_gt.squeeze(-1)[_valid]\n'
         '\n'
         '            if _dp.numel() > 100:\n'
-        '                # Pearson correlation (scale-invariant, ideal for monocular depth)\n'
-        '                _dp_c = _dp - _dp.mean()\n'
-        '                _dg_c = _dg - _dg.mean()\n'
-        '                _pearson = (_dp_c * _dg_c).sum() / (\n'
-        '                    torch.sqrt((_dp_c ** 2).sum() * (_dg_c ** 2).sum()) + 1e-8)\n'
+        '                # Per-frame least-squares: (a * depth_gt + b) ≈ depth_pred\n'
+        '                # Detach dp in solve so gradients flow only through L1,\n'
+        '                # not back through the alignment parameters.\n'
+        '                _A = torch.stack([_dg, torch.ones_like(_dg)], dim=-1)  # [N, 2]\n'
+        '                _b_vec = _dp.detach().unsqueeze(-1)  # [N, 1]\n'
+        '                _ATA = _A.T @ _A  # [2, 2]\n'
+        '                _ATb = _A.T @ _b_vec  # [2, 1]\n'
+        '                _params = torch.linalg.solve(\n'
+        '                    _ATA + 1e-6 * torch.eye(2, device=_ATA.device), _ATb)\n'
+        '                _scale_ab = _params[0, 0].detach()\n'
+        '                _shift_ab = _params[1, 0].detach()\n'
+        '                _dg_aligned = _scale_ab * _dg + _shift_ab\n'
+        '\n'
+        '                # Gradient-aware weighting: stronger on textureless regions,\n'
+        '                # weaker at edges where depth discontinuities are expected\n'
+        '                _rgb = outputs["rgb"].detach()  # [H, W, 3]\n'
+        '                _H, _W = _rgb.shape[:2]\n'
+        '                _grad_x = torch.abs(_rgb[1:, :, :] - _rgb[:-1, :, :]).mean(dim=-1)\n'
+        '                _grad_y = torch.abs(_rgb[:, 1:, :] - _rgb[:, :-1, :]).mean(dim=-1)\n'
+        '                _grad = torch.zeros(_H, _W, device=_rgb.device)\n'
+        '                _grad[:-1, :] += _grad_x\n'
+        '                _grad[:, :-1] += _grad_y\n'
+        '                _edge_weight = torch.exp(-_grad * 10.0)\n'
+        '                _ew_valid = _edge_weight[_valid]\n'
+        '\n'
+        '                # Gradient-weighted L1 depth loss\n'
+        '                _depth_l1 = (_ew_valid * torch.abs(_dp - _dg_aligned)).mean()\n'
         '\n'
         '                # Linear decay: depth weight decreases over training\n'
         '                _t = max(0.0, min(1.0,\n'
@@ -149,9 +184,8 @@ def patch_splatfacto_loss(src):
         '                    1.0 - _t * (1.0 - self.config.depth_weight_decay))\n'
         '\n'
         '                # Opacity-frozen gradient: depth updates means, scales, quats\n'
-        '                # but NOT opacities. Opacity gradients from depth kill MCMC\n'
-        '                # population (200K→12K alive) → scale explosion → OOM.\n'
-        '                _depth_loss = _dw * (1 - _pearson)\n'
+        '                # but NOT opacities (critical for MCMC stability)\n'
+        '                _depth_loss = _dw * _depth_l1\n'
         '                torch.autograd.backward(\n'
         '                    _depth_loss,\n'
         '                    inputs=[self.gauss_params["means"],\n'
@@ -161,13 +195,64 @@ def patch_splatfacto_loss(src):
         '                )\n'
         '\n'
         '                if self.step % 100 == 0:\n'
-        '                    print(f"[DEPTH] step={self.step} pearson={_pearson.item():.4f} weight={_dw:.4f}")\n'
+        '                    print(f"[DEPTH] step={self.step} l1={_depth_l1.item():.4f} "\n'
+        '                          f"weight={_dw:.4f} scale={_scale_ab.item():.3f} "\n'
+        '                          f"shift={_shift_ab.item():.3f}")\n'
+        '\n'
+        '                # ── Normal regularization from depth gradients ──\n'
+        '                # Compute surface normals from rendered depth and aligned GT\n'
+        '                # depth via central differences. Cosine distance loss constrains\n'
+        '                # depth surface orientation, reducing floaters.\n'
+        '                if self.config.normal_loss_mult > 0:\n'
+        '                    _dp_2d = _depth_pred.squeeze(-1)  # [H, W]\n'
+        '                    _dg_2d = _depth_gt.squeeze(-1)  # [H, W]\n'
+        '                    # Normals from rendered depth\n'
+        '                    _nr_dx = torch.zeros_like(_dp_2d)\n'
+        '                    _nr_dy = torch.zeros_like(_dp_2d)\n'
+        '                    _nr_dx[:, 1:-1] = (_dp_2d[:, 2:] - _dp_2d[:, :-2]) / 2\n'
+        '                    _nr_dy[1:-1, :] = (_dp_2d[2:, :] - _dp_2d[:-2, :]) / 2\n'
+        '                    _n_r = torch.stack([-_nr_dx, -_nr_dy,\n'
+        '                        torch.ones_like(_dp_2d)], dim=-1)\n'
+        '                    _n_r = F.normalize(_n_r, dim=-1)\n'
+        '\n'
+        '                    # Normals from aligned GT depth\n'
+        '                    _dg_al_2d = (_scale_ab * _dg_2d + _shift_ab).detach()\n'
+        '                    _ng_dx = torch.zeros_like(_dg_al_2d)\n'
+        '                    _ng_dy = torch.zeros_like(_dg_al_2d)\n'
+        '                    _ng_dx[:, 1:-1] = (_dg_al_2d[:, 2:] - _dg_al_2d[:, :-2]) / 2\n'
+        '                    _ng_dy[1:-1, :] = (_dg_al_2d[2:, :] - _dg_al_2d[:-2, :]) / 2\n'
+        '                    _n_g = torch.stack([-_ng_dx, -_ng_dy,\n'
+        '                        torch.ones_like(_dg_al_2d)], dim=-1)\n'
+        '                    _n_g = F.normalize(_n_g, dim=-1)\n'
+        '\n'
+        '                    # Valid: good alpha, skip border pixels (finite diff artifacts)\n'
+        '                    _nv = (_alpha.squeeze(-1) > 0.1) & (_dg_2d > 0)\n'
+        '                    _nv[:1, :] = False\n'
+        '                    _nv[-1:, :] = False\n'
+        '                    _nv[:, :1] = False\n'
+        '                    _nv[:, -1:] = False\n'
+        '\n'
+        '                    if _nv.sum() > 100:\n'
+        '                        # Cosine distance: 1 - dot(n_rendered, n_gt)\n'
+        '                        _n_loss = (1 - (_n_r[_nv] * _n_g[_nv]\n'
+        '                            ).sum(dim=-1)).mean()\n'
+        '                        _normal_loss = self.config.normal_loss_mult * _n_loss\n'
+        '                        torch.autograd.backward(\n'
+        '                            _normal_loss,\n'
+        '                            inputs=[self.gauss_params["means"],\n'
+        '                                    self.gauss_params["scales"],\n'
+        '                                    self.gauss_params["quats"]],\n'
+        '                            retain_graph=True\n'
+        '                        )\n'
+        '                        if self.step % 100 == 0:\n'
+        '                            print(f"[NORMAL] step={self.step} "\n'
+        '                                  f"loss={_n_loss.item():.4f}")\n'
         '\n'
         '        return loss_dict'
     )
 
     src = src.replace(anchor, new_code)
-    print("[PATCH C] Added Pearson depth loss with means-only gradient freeze")
+    print("[PATCH C] Added aligned L1 depth loss + normal regularization")
     return src
 
 
@@ -239,12 +324,12 @@ def patch_splatfacto_diagnostics(src):
 
 
 def patch_base_dataset(path):
-    """Patch E: Load .npy depth maps alongside images in InputDataset."""
+    """Patch E: Store depth map paths for lazy loading in InputDataset.get_data()."""
     with open(path, 'r') as f:
         src = f.read()
 
-    if 'depth_image' in src:
-        print("[PATCH E] Already has depth_image loading, skipping")
+    if '_lazy_depth_path' in src or 'depth_image' in src:
+        print("[PATCH E] Already has depth loading, skipping")
         return
 
     if 'import numpy as np' not in src:
@@ -268,14 +353,14 @@ def patch_base_dataset(path):
     return_stmt = return_match.group(2)
 
     depth_code = f'''
-{indent}# Load depth map if available (Onyx depth supervision)
+{indent}# Store depth path for lazy loading (loaded per training step in next_train,
+{indent}# not cached in RAM — saves ~4.5GB for 589 images)
 {indent}try:
 {indent}    img_path = self._dataparser_outputs.image_filenames[image_idx]
 {indent}    depths_dir = img_path.parent.parent / "depths"
 {indent}    depth_path = depths_dir / f"{{img_path.stem}}.npy"
 {indent}    if depth_path.exists():
-{indent}        depth_np = np.load(str(depth_path))
-{indent}        data["depth_image"] = torch.from_numpy(depth_np).unsqueeze(-1).float()
+{indent}        data["_lazy_depth_path"] = str(depth_path)
 {indent}except Exception:
 {indent}    pass
 '''
@@ -285,7 +370,130 @@ def patch_base_dataset(path):
     with open(path, 'w') as f:
         f.write(src)
 
-    print("[PATCH E] Added depth_image loading to InputDataset")
+    print("[PATCH E] Added lazy depth path to InputDataset.get_data()")
+
+
+def find_datamanager():
+    """Find full_images_datamanager.py in nerfstudio installation."""
+    paths = glob.glob("/usr/local/lib/python*/dist-packages/nerfstudio/data/datamanagers/full_images_datamanager.py")
+    if not paths:
+        print("ERROR: full_images_datamanager.py not found")
+        sys.exit(1)
+    return paths[0]
+
+
+def patch_lazy_cache(path):
+    """Patch H: Lazy image + depth loading in FullImageDatamanager.
+
+    Replaces eager image caching with on-demand disk loading.
+    Non-distorted images (PINHOLE) are marked lazy — tensors freed after
+    the caching loop, reloaded from disk per training step.
+    Depth maps (_lazy_depth_path from Patch E) loaded per step.
+
+    Reduces steady-state RAM from ~18GB to <1GB for 589 images.
+    Peak memory during init is unchanged (images loaded for undistortion check).
+    """
+    with open(path, 'r') as f:
+        src = f.read()
+
+    if '_lazy_image' in src:
+        print("[PATCH H] Already has lazy loading, skipping")
+        return
+
+    # ── Part 1: Replace device-move block in _load_images ──
+    old_block = (
+        '        # Move to device.\n'
+        '        if cache_images_device == "gpu":\n'
+        '            for cache in undistorted_images:\n'
+        '                cache["image"] = cache["image"].to(self.device)\n'
+        '                if "mask" in cache:\n'
+        '                    cache["mask"] = cache["mask"].to(self.device)\n'
+        '                if "depth" in cache:\n'
+        '                    cache["depth"] = cache["depth"].to(self.device)\n'
+        '                self.train_cameras = self.train_dataset.cameras.to(self.device)\n'
+        '        elif cache_images_device == "cpu":\n'
+        '            for cache in undistorted_images:\n'
+        '                cache["image"] = cache["image"].pin_memory()\n'
+        '                if "mask" in cache:\n'
+        '                    cache["mask"] = cache["mask"].pin_memory()\n'
+        '                self.train_cameras = self.train_dataset.cameras\n'
+        '        else:\n'
+        '            assert_never(cache_images_device)\n'
+        '        return undistorted_images'
+    )
+
+    new_block = (
+        '        # ── Lazy loading: free image tensors, reload from disk on demand ──\n'
+        '        # Non-distorted (PINHOLE) cameras: on-disk image matches cached version.\n'
+        '        # Distorted images stay cached (undistortion can\'t be replayed).\n'
+        '        _n_lazy = 0\n'
+        '        for _i, _d in enumerate(undistorted_images):\n'
+        '            _cam = dataset.cameras[_i].reshape(())\n'
+        '            _no_distort = _cam.distortion_params is None or torch.all(_cam.distortion_params == 0)\n'
+        '            if split == "train" and _no_distort and "image" in _d:\n'
+        '                _d["_lazy_image"] = True\n'
+        '                del _d["image"]\n'
+        '                _n_lazy += 1\n'
+        '            elif "image" in _d:\n'
+        '                if cache_images_device == "gpu":\n'
+        '                    _d["image"] = _d["image"].to(self.device)\n'
+        '                elif cache_images_device == "cpu":\n'
+        '                    _d["image"] = _d["image"].pin_memory()\n'
+        '            if "mask" in _d:\n'
+        '                if cache_images_device == "gpu":\n'
+        '                    _d["mask"] = _d["mask"].to(self.device)\n'
+        '        if split == "train":\n'
+        '            if cache_images_device == "gpu":\n'
+        '                self.train_cameras = self.train_dataset.cameras.to(self.device)\n'
+        '            else:\n'
+        '                self.train_cameras = self.train_dataset.cameras\n'
+        '        print(f"[LAZY] {_n_lazy}/{len(undistorted_images)} {split} images lazy (disk)")\n'
+        '        return undistorted_images'
+    )
+
+    if old_block not in src:
+        print("[PATCH H] WARNING: device-move anchor not found in _load_images, skipping")
+        return
+
+    src = src.replace(old_block, new_block)
+
+    # ── Part 2: Patch next_train for lazy image + depth resolution ──
+    old_next = (
+        '        data = self.cached_train[image_idx]\n'
+        '        # We\'re going to copy to make sure we don\'t mutate the cached dictionary.\n'
+        '        # This can cause a memory leak: https://github.com/nerfstudio-project/nerfstudio/issues/3335\n'
+        '        data = data.copy()\n'
+        '        data["image"] = data["image"].to(self.device)'
+    )
+
+    new_next = (
+        '        data = self.cached_train[image_idx]\n'
+        '        data = data.copy()\n'
+        '        # Lazy image: reload from disk (non-distorted cameras)\n'
+        '        if data.get("_lazy_image"):\n'
+        '            if self.config.cache_images_type == "uint8":\n'
+        '                data["image"] = self.train_dataset.get_image_uint8(image_idx).to(self.device)\n'
+        '            else:\n'
+        '                data["image"] = self.train_dataset.get_image_float32(image_idx).to(self.device)\n'
+        '        else:\n'
+        '            data["image"] = data["image"].to(self.device)\n'
+        '        # Lazy depth: load .npy from path stored by Patch E\n'
+        '        if "_lazy_depth_path" in data:\n'
+        '            import numpy as np\n'
+        '            data["depth_image"] = torch.from_numpy(\n'
+        '                np.load(data["_lazy_depth_path"])).unsqueeze(-1).float()'
+    )
+
+    if old_next not in src:
+        print("[PATCH H] WARNING: next_train anchor not found, skipping")
+        return
+
+    src = src.replace(old_next, new_next)
+
+    with open(path, 'w') as f:
+        f.write(src)
+
+    print("[PATCH H] Added lazy image + depth loading to FullImageDatamanager")
 
 
 def main():
@@ -309,6 +517,10 @@ def main():
     dataset_path = find_base_dataset()
     print(f"\nPatching: {dataset_path}")
     patch_base_dataset(dataset_path)
+
+    datamanager_path = find_datamanager()
+    print(f"\nPatching: {datamanager_path}")
+    patch_lazy_cache(datamanager_path)
 
     print("\nAll depth patches applied.")
 

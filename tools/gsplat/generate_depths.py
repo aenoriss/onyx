@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Generate monocular depth maps using Depth Anything V2.
+"""Generate monocular depth maps and surface normals using Depth Anything V2.
 
-Processes all images in a directory and saves relative depth maps as .npy files.
-These are used as supervision signal during Gaussian Splatting training.
+Processes all images in a directory and saves:
+  - {stem}.npy — relative depth map (float32, H×W)
+  - {stem}_normal.npy — surface normals from depth gradients (float32, H×W×3)
+
+Depth maps are used as supervision signal during Gaussian Splatting training
+(per-frame aligned L1 loss). Normal maps provide optional normal regularization.
 
 DAv2 outputs relative (affine-invariant) depth — not metric. The training loss
-uses Pearson correlation which is scale/shift invariant, so metric depth is
+performs per-frame least-squares alignment (scale + shift), so metric depth is
 not needed.
 
 Usage:
@@ -60,6 +64,25 @@ def load_model(encoder="vits"):
     return model
 
 
+def depth_to_normals(depth):
+    """Compute surface normals from depth map via cross-product of gradients.
+
+    Uses pixel-space finite differences (no focal length needed since normals
+    are normalized). Convention: [-dz/dx, -dz/dy, 1] → normalized.
+
+    Args:
+        depth: (H, W) depth map (higher = farther from camera)
+
+    Returns:
+        (H, W, 3) unit normal map (float32)
+    """
+    dz_dx = np.gradient(depth, axis=1)
+    dz_dy = np.gradient(depth, axis=0)
+    normals = np.stack([-dz_dx, -dz_dy, np.ones_like(depth)], axis=-1)
+    norm = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-8
+    return (normals / norm).astype(np.float32)
+
+
 def generate_depth_maps(images_dir, output_dir, encoder="vits", max_dim=518):
     """Generate depth maps for all images in directory.
 
@@ -106,15 +129,20 @@ def generate_depth_maps(images_dir, output_dir, encoder="vits", max_dim=518):
         else:
             depth_norm = np.zeros_like(depth)
 
-        # Save as .npy (float32, same HxW as original image)
+        # Save depth as .npy (float32, same HxW as original image)
         stem = os.path.splitext(fname)[0]
         out_path = os.path.join(output_dir, f"{stem}.npy")
         np.save(out_path, depth_norm.astype(np.float32))
 
+        # Save surface normals from depth gradients
+        normals = depth_to_normals(depth_norm)
+        normal_path = os.path.join(output_dir, f"{stem}_normal.npy")
+        np.save(normal_path, normals)
+
         if (i + 1) % 50 == 0 or (i + 1) == len(image_files):
             print(f"[DEPTH] {i+1}/{len(image_files)} done")
 
-    print(f"[DEPTH] Saved {len(image_files)} depth maps to {output_dir}")
+    print(f"[DEPTH] Saved {len(image_files)} depth + normal maps to {output_dir}")
     return len(image_files)
 
 

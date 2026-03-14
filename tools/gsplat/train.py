@@ -309,12 +309,14 @@ def main():
         "--steps-per-eval-image", "0",
         "--steps-per-eval-all-images", "0",
         "--steps-per-save", str(args.iterations),
-        # Recycle semi-transparent ghosts faster (MCMC default 0.005 too conservative for 300+ images)
-        "--pipeline.model.cull-alpha-thresh", "0.03",
+        # MCMC relocation threshold (paper default 0.005 — higher values cause
+        # excessive relocation churn → intersection buffer OOM spikes)
+        "--pipeline.model.cull-alpha-thresh", "0.005",
         # Per-image exposure/WB correction (off by default, causes shadow artifacts on ceilings)
         "--pipeline.model.use-bilateral-grid", str(args.bilateral_grid),
-        # Gaussian cap (overridable via --max-gs-num)
-        "--pipeline.model.max-gs-num", str(args.max_gs_num or 1000000),
+        # Gaussian cap — 500K with depth (MCMC never prunes, excess are dead weight
+        # that inflate isect_tiles buffer → OOM spikes). 1M without depth.
+        "--pipeline.model.max-gs-num", str(args.max_gs_num or (500000 if args.depth else 1000000)),
         # Learn pose corrections from SfM imprecision
         "--pipeline.model.camera-optimizer.mode", "SO3xR3",
         # Depth supervision (Depth Anything V2 priors)
