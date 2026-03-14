@@ -226,6 +226,8 @@ def main():
                              "(constrains Gaussians to surfaces)")
     parser.add_argument("--depth-weight", type=float, default=0.2,
                         help="Depth loss weight (default: 0.2)")
+    parser.add_argument("--normal-weight", type=float, default=None,
+                        help="Normal regularization weight (default: 0.02 with depth, 0 without)")
     parser.add_argument("--max-gs-num", type=int, default=None,
                         help="Maximum number of Gaussians (default: 300K with depth, 1M without)")
     args = parser.parse_args()
@@ -265,6 +267,10 @@ def main():
     print(f"Strategy:  {'MCMC' if args.mcmc else 'ADC (default)'}")
     print(f"BilGrid:   {'Yes' if args.bilateral_grid else 'No'}")
     print(f"Depth:     {'DAv2 (weight=' + str(args.depth_weight) + ')' if args.depth else 'No'}")
+    # Normal loss defaults to 0.02 when depth is enabled
+    if args.normal_weight is None:
+        args.normal_weight = 0.02 if args.depth else 0.0
+    print(f"Normals:   {'weight=' + str(args.normal_weight) if args.normal_weight > 0 else 'No'}")
     print(f"CamOptim:  SO3xR3")
     if args.init_pcd:
         print(f"Dense init: {args.init_pcd} (target {args.dense_init_pts:,} pts)")
@@ -323,7 +329,8 @@ def main():
         # Uses native RGB+ED render (depth from same rasterization, zero extra VRAM)
         # Gradient freeze (DNGaussian) prevents depth from inflating scales
         "--pipeline.model.depth-loss-mult", str(args.depth_weight if args.depth else 0.0),
-        "--pipeline.model.output-depth-during-training", str(args.depth),
+        "--pipeline.model.normal-loss-mult", str(args.normal_weight),
+        "--pipeline.model.output-depth-during-training", str(args.depth or args.normal_weight > 0),
         "colmap",
         "--data", ws,
         "--images-path", "colmap/images",

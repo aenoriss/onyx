@@ -935,7 +935,7 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
 def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
     quality = config.get("quality", "proto")
     scene = config.get("scene", "indoor")
-    iterations = "120000" if quality == "dense" else "7000"
+    iterations = "60000" if quality == "dense" else "7000"
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
