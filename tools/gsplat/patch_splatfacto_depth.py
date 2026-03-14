@@ -18,8 +18,6 @@ Patches:
   D. get_outputs — VRAM + Gaussian diagnostics (every 500 steps)
   E. InputDataset — store depth path for lazy loading
   H. FullImageDatamanager — lazy image + depth loading (free RAM after cache)
-  I. SplatfactoModel — StableGS dual opacity (geometric + auxiliary)
-  J. Optimizers — default optimizer for custom param groups (opacities_aux)
 """
 
 import re
@@ -68,8 +66,6 @@ def patch_splatfacto_config(src):
     """Steps over which depth weight decays (from depth_loss_start_step)."""
     normal_loss_mult: float = 0.0
     """Normal regularization weight (cosine distance). 0 = disabled. Recommended: 0.01-0.05"""
-    dual_opacity_start_step: int = 15000
-    """Start dual opacity (StableGS) depth→geometry gradient after this step."""
 '''
 
     src = src[:insert_after] + new_fields + src[insert_after:]
@@ -87,9 +83,8 @@ def patch_splatfacto_loss(src):
     Optional normal regularization computes surface normals from rendered and
     aligned GT depth via finite differences, penalizing cosine distance.
 
-    Depth gradients update means, scales, quats via selective backward.
-    Before dual_opacity_start_step: opacities frozen (MCMC stabilization).
-    After: geometric opacity unfrozen, auxiliary shielded (StableGS).
+    Depth gradients update means, scales, and quats via selective backward.
+    Opacities are frozen — critical for MCMC compatibility.
     """
 
     # Replace the end of get_loss_dict to add depth + normal loss
@@ -188,24 +183,19 @@ def patch_splatfacto_loss(src):
         '                _dw = self.config.depth_loss_mult * (\n'
         '                    1.0 - _t * (1.0 - self.config.depth_weight_decay))\n'
         '\n'
-        '                # Selective gradient: depth updates means, scales, quats.\n'
-        '                # After dual_opacity_start_step, also updates geometric opacity\n'
-        '                # (StableGS architecture: auxiliary opacity shielded from depth).\n'
+        '                # Opacity-frozen gradient: depth updates means, scales, quats\n'
+        '                # but NOT opacities (critical for MCMC stability)\n'
         '                _depth_loss = _dw * _depth_l1\n'
         '                _dinputs = [self.gauss_params["means"],\n'
         '                    self.gauss_params["scales"],\n'
         '                    self.gauss_params["quats"]]\n'
-        '                if (hasattr(self.config, "dual_opacity_start_step")\n'
-        '                        and self.step >= self.config.dual_opacity_start_step):\n'
-        '                    _dinputs.append(self.gauss_params["opacities"])\n'
         '                torch.autograd.backward(\n'
         '                    _depth_loss, inputs=_dinputs, retain_graph=True)\n'
         '\n'
         '                if self.step % 100 == 0:\n'
-        '                    _do = " dual_opac" if len(_dinputs) > 3 else ""\n'
         '                    print(f"[DEPTH] step={self.step} l1={_depth_l1.item():.4f} "\n'
         '                          f"weight={_dw:.4f} scale={_scale_ab.item():.3f} "\n'
-        '                          f"shift={_shift_ab.item():.3f}{_do}")\n'
+        '                          f"shift={_shift_ab.item():.3f}")\n'
         '\n'
         '                # ── Normal regularization from depth gradients ──\n'
         '                # Compute surface normals from rendered depth and aligned GT\n'
@@ -377,140 +367,6 @@ def patch_base_dataset(path):
     print("[PATCH E] Added lazy depth path to InputDataset.get_data()")
 
 
-def patch_dual_opacity(src):
-    """Patch I: StableGS dual opacity — add auxiliary opacity parameter + dual rendering.
-
-    Each Gaussian gets a second opacity parameter (opacities_aux) initialized to
-    logit(0.99) ≈ 1.0. The rasterization uses sigmoid(opac) * sigmoid(opac_aux),
-    which is ~= sigmoid(opac) at initialization (seamless transition).
-
-    Gradient isolation (StableGS principle):
-    - opacities_aux receives gradient ONLY from RGB loss (appearance)
-    - opacities receives gradient from RGB + depth (after dual_opacity_start_step)
-    - Depth cannot corrupt appearance opacity → no fog, no collapse
-
-    MCMC handles opacities_aux automatically: generic param iteration copies it
-    during relocate/sample_add. Only 'opacities' gets special relocation treatment.
-    """
-    if 'opacities_aux' in src:
-        print("[PATCH I] Already has dual opacity, skipping")
-        return src
-
-    # ── Part 1: Add opacities_aux to gauss_params ──
-    old_params = (
-        '                "opacities": opacities,\n'
-        '            }\n'
-        '        )'
-    )
-    new_params = (
-        '                "opacities": opacities,\n'
-        '                "opacities_aux": torch.nn.Parameter(\n'
-        '                    torch.logit(0.99 * torch.ones_like(opacities.data))),\n'
-        '            }\n'
-        '        )'
-    )
-
-    if old_params not in src:
-        print("[PATCH I] WARNING: gauss_params anchor not found, skipping")
-        return src
-
-    src = src.replace(old_params, new_params)
-
-    # ── Part 2: Use dual opacity in rasterization ──
-    old_opac = '            opacities=torch.sigmoid(opacities_crop).squeeze(-1),'
-    new_opac = (
-        '            opacities=(torch.sigmoid(opacities_crop) * (\n'
-        '                torch.sigmoid(self.gauss_params["opacities_aux"][crop_ids]\n'
-        '                    if crop_ids is not None else self.gauss_params["opacities_aux"])\n'
-        '                if "opacities_aux" in self.gauss_params else 1.0)\n'
-        '            ).squeeze(-1),'
-    )
-
-    if old_opac not in src:
-        print("[PATCH I] WARNING: rasterization opacity anchor not found, skipping")
-        return src
-
-    src = src.replace(old_opac, new_opac)
-
-    # ── Part 3: Add opacities_aux to optimizer param groups ──
-    old_groups = (
-        '        return {\n'
-        '            name: [self.gauss_params[name]]\n'
-        '            for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]\n'
-        '        }'
-    )
-    new_groups = (
-        '        _names = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]\n'
-        '        if "opacities_aux" in self.gauss_params:\n'
-        '            _names.append("opacities_aux")\n'
-        '        return {\n'
-        '            name: [self.gauss_params[name]]\n'
-        '            for name in _names\n'
-        '        }'
-    )
-
-    if old_groups not in src:
-        print("[PATCH I] WARNING: param_groups anchor not found, opacities_aux may not be optimized!")
-    else:
-        src = src.replace(old_groups, new_groups)
-
-    print("[PATCH I] Added StableGS dual opacity (opacities_aux + dual rendering + optimizer)")
-    return src
-
-
-def find_optimizers():
-    """Find optimizers.py in nerfstudio installation."""
-    paths = glob.glob("/usr/local/lib/python*/dist-packages/nerfstudio/engine/optimizers.py")
-    if not paths:
-        print("ERROR: optimizers.py not found")
-        sys.exit(1)
-    return paths[0]
-
-
-def patch_optimizer_default(path):
-    """Patch J: Default optimizer for unknown param groups (e.g. opacities_aux).
-
-    Nerfstudio crashes with RuntimeError if a param group from the model
-    isn't in the optimizer config. This patch adds a default Adam(lr=0.05)
-    for unrecognized groups, matching the opacity learning rate.
-    """
-    with open(path, 'r') as f:
-        src = f.read()
-
-    if 'Auto-default' in src:
-        print("[PATCH J] Already has optimizer default, skipping")
-        return
-
-    old_error = (
-        '            # Print some nice warning messages if the user forgot to specify an optimizer\n'
-        '            if param_group_name not in config:\n'
-        '                raise RuntimeError(\n'
-        '                    f"""Optimizer config for \'{param_group_name}\' not found in config file. Make sure you specify an optimizer for each parameter group. Provided configs were: {config.keys()}"""\n'
-        '                )'
-    )
-
-    new_default = (
-        '            # Auto-default: create Adam optimizer for custom param groups\n'
-        '            if param_group_name not in config:\n'
-        '                config[param_group_name] = {\n'
-        '                    "optimizer": AdamOptimizerConfig(lr=0.05),\n'
-        '                    "scheduler": None,\n'
-        '                }\n'
-        '                print(f"[OPTIM] Auto-created Adam(lr=0.05) for param group: {param_group_name}")'
-    )
-
-    if old_error not in src:
-        print("[PATCH J] WARNING: optimizer error anchor not found, skipping")
-        return
-
-    src = src.replace(old_error, new_default)
-
-    with open(path, 'w') as f:
-        f.write(src)
-
-    print("[PATCH J] Added default optimizer for unknown param groups")
-
-
 def find_datamanager():
     """Find full_images_datamanager.py in nerfstudio installation."""
     paths = glob.glob("/usr/local/lib/python*/dist-packages/nerfstudio/data/datamanagers/full_images_datamanager.py")
@@ -642,7 +498,6 @@ def main():
         src = f.read()
 
     src = patch_splatfacto_config(src)
-    src = patch_dual_opacity(src)
     src = patch_splatfacto_loss(src)
     src = patch_splatfacto_scale_clamp(src)
     src = patch_splatfacto_pruning(src)
@@ -660,10 +515,6 @@ def main():
     datamanager_path = find_datamanager()
     print(f"\nPatching: {datamanager_path}")
     patch_lazy_cache(datamanager_path)
-
-    optimizers_path = find_optimizers()
-    print(f"\nPatching: {optimizers_path}")
-    patch_optimizer_default(optimizers_path)
 
     print("\nAll depth patches applied.")
 
