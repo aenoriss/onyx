@@ -94,7 +94,7 @@ def _setup_windows_console():
 GHCR_REGISTRY = "ghcr.io/aenoriss"
 
 SHARED_STEPS = ["INGEST", "SFM"]
-RUN_STEPS = ["MASKING", "DENSIFICATION", "RECONSTRUCTION", "DIFIX_REFINE", "SEGFORMER"]
+RUN_STEPS = ["MASKING", "DENSIFICATION", "RECONSTRUCTION", "SEGFORMER"]
 ALL_STEPS = SHARED_STEPS + RUN_STEPS
 
 TARGET_IMAGES = {
@@ -102,10 +102,10 @@ TARGET_IMAGES = {
     ("outdoor", "proto"):      150,
     ("outdoor", "yono"):       150,
     ("outdoor", "dense"):      450,
-    ("indoor",  "production"): 437,
+    ("indoor",  "production"): 480,
     ("indoor",  "proto"):      100,
     ("indoor",  "yono"):       100,
-    ("indoor",  "dense"):      400,
+    ("indoor",  "dense"):      480,
 }
 
 RECONSTRUCTION_CONTAINER = {
@@ -124,7 +124,6 @@ ALL_CONTAINERS = [
     "onyx-gsplat",
     # "onyx-yonosplat",  # temporarily excluded from install
     "onyx-openmvs",
-    "onyx-difix3d",
     "onyx-segformer",
 ]
 
@@ -212,8 +211,7 @@ def get_required_containers(config=None):
     # dense mode also needs openmvs for the densify step
     if mode == "gaussian" and quality == "dense":
         containers.append("onyx-openmvs")
-    if config.get("difix3d"):
-        containers.append("onyx-difix3d")
+    # DiFix3D+ is inline in the gsplat/milo containers — no separate container needed
     if config.get("segment") or config.get("mask_classes"):
         containers.append("onyx-segformer")
     return containers
@@ -323,7 +321,6 @@ class PipelineState:
                 "segment": config.get("segment", False),
                 "mask_classes": config.get("mask_classes"),
                 "difix3d": config.get("difix3d", False),
-                "difix3d_test": config.get("difix3d_test", False),
                 "local": config.get("local", False),
                 "bilateral_grid": config.get("bilateral_grid", False),
                 "depth": config.get("depth", False),
@@ -350,7 +347,7 @@ class PipelineState:
                         if (step != "SEGFORMER" or config.get("segment", False))
                         and (step != "MASKING" or config.get("mask_classes"))
                         and (step != "DENSIFICATION" or config.get("quality") == "dense")
-                        and (step != "DIFIX_REFINE" or config.get("difix3d", False))
+
                     },
                 }
             ],
@@ -517,7 +514,7 @@ class PipelineState:
                 if (step != "SEGFORMER" or segment)
                 and (step != "MASKING" or mask_classes)
                 and (step != "DENSIFICATION" or quality == "dense")
-                and (step != "DIFIX_REFINE" or self.data["base_config"].get("difix3d", False))
+
             },
         }
         self.data["runs"].append(run)
@@ -875,11 +872,6 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
         _run_openmvs(config, state, output_dir, dry_run)
 
 
-def step_difix_refine(config, state, output_dir, dry_run=False):
-    """Step: DiFix3D+ post-processing refinement on trained splat."""
-    state.start_step("DIFIX_REFINE", "onyx-difix3d")
-    _run_difix_refine(config, state, output_dir, dry_run)
-
 
 def _run_openmvs_densify(config, state, output_dir, dry_run):
     """Run OpenMVS densification only (no mesh), to produce a dense point cloud for MILo."""
@@ -925,8 +917,6 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
         cmd.append("--dense")
     if config.get("difix3d", False):
         cmd.append("--difix3d")
-        if config.get("difix3d_test", False):
-            cmd.append("--difix3d_test")
     if config.get("mask_classes"):
         cmd.extend(["--masks", "/data/masks"])
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
@@ -963,32 +953,12 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
         cmd.extend(["--depth", "--depth-weight",
                      str(config.get("depth_weight", 0.2))])
 
+    # DiFix3D+ inline fix cycles (interleaved during training)
+    if config.get("difix3d", False):
+        cmd.append("--difix3d")
+
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
-
-def _run_difix_refine(config, state, output_dir, dry_run):
-    """Run DiFix3D+ post-processing refinement on a trained splat PLY."""
-    # Find the splat PLY from RECONSTRUCTION step
-    splat_ply = os.path.join(output_dir, "output", "splatfacto", "ply", "splat.ply")
-    if not os.path.exists(splat_ply):
-        print(f"[ERROR] No splat PLY found at {splat_ply} — skipping DIFIX_REFINE")
-        state.skip_step("DIFIX_REFINE", "no splat PLY from RECONSTRUCTION")
-        return
-
-    cmd = [
-        "docker", "run", "--rm", "--gpus", "all", "--ipc=host",
-        *uid_gid_flags(),
-        "-e", "HOME=/tmp",
-        "-v", f"{docker_path(output_dir)}:/data",
-        image_name(config.get("local", False), "onyx-difix3d"),
-        "--scene", "/data",
-        "--init-ply", "/data/output/splatfacto/ply/splat.ply",
-        "--output", "/data/output/difix3d",
-        "--steps", "10000",
-        "--fix-interval", "2000",
-    ]
-
-    run_docker(cmd, "DIFIX_REFINE", state, output_dir, dry_run)
 
 
 def _run_openmvs(config, state, output_dir, dry_run):
@@ -1660,9 +1630,7 @@ def parse_args():
     parser.add_argument("--segment", action="store_true",
                         help="Run Segformer masking after reconstruction")
     parser.add_argument("--difix3d", action="store_true",
-                        help="Enable Difix3D+ fix cycles during MILo training")
-    parser.add_argument("--difix3d_test", action="store_true",
-                        help="Quick Difix test cycle at iter 100 (4 views) to validate setup")
+                        help="Enable Difix3D+ interleaved fix cycles during training")
     parser.add_argument("--bilateral-grid", action="store_true",
                         help="Enable bilateral grid (per-image exposure/WB correction, "
                              "useful for outdoor/360, can cause shadow artifacts indoors)")
@@ -1733,16 +1701,11 @@ def main():
         if args.interval:
             config["interval_override"] = args.interval
 
-        # Allow enabling difix3d on resume (inject step if missing)
+        # Allow enabling difix3d on resume
         if args.difix3d and not config.get("difix3d"):
             config["difix3d"] = True
             state.data["base_config"]["difix3d"] = True
-            run_steps = state.active_run["steps"]
-            if "DIFIX_REFINE" not in run_steps:
-                # Insert before SEGFORTER if present, otherwise append
-                run_steps["DIFIX_REFINE"] = {"status": "pending"}
-                state.save()
-                print("[RESUME] Injected DIFIX_REFINE step (--difix3d flag)")
+            state.save()
 
         if args.from_step:
             state.reset_from(args.from_step)
@@ -1805,7 +1768,6 @@ def main():
             "segment": args.segment,
             "mask_classes": args.mask_classes,
             "difix3d": args.difix3d,
-            "difix3d_test": args.difix3d_test,
             "bilateral_grid": args.bilateral_grid,
             "depth": args.depth,
             "depth_weight": args.depth_weight,
@@ -1876,7 +1838,6 @@ def main():
         "MASKING": step_masking,
         "DENSIFICATION": step_densification,
         "RECONSTRUCTION": step_reconstruction,
-        "DIFIX_REFINE": step_difix_refine,
         "SEGFORMER": step_segformer,
     }
 
