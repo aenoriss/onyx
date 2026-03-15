@@ -204,6 +204,7 @@ def select_and_prune(
     underestimating true overlap).
 
     Args:
+        target_count: Target number of tiles to keep (set by orchestrator)
         max_overlap: Maximum overlap ratio to consider frames redundant (0.45 = 45%)
         max_gap: Force-keep after this many skipped frames (prevents coverage gaps)
     """
@@ -212,12 +213,10 @@ def select_and_prune(
 
     n_featureless = sum(1 for s in scores if s.sift_count < min_sift)
 
-    # Overshoot: keep 1.6x target to compensate for InstantSfM dropping
-    # unregistered images during SfM (typically 10-40% fail to register)
-    keep_budget = int(target_count * 1.6)
+    keep_budget = target_count
     print(f"[SELECT] {len(scores)} total, {n_featureless} featureless "
           f"(< {min_sift} SIFT)")
-    print(f"[SELECT] Budget: {keep_budget} tiles (target {target_count}, 1.6x overshoot)")
+    print(f"[SELECT] Budget: {keep_budget} tiles (target {target_count})")
 
     # Group ALL tiles by frame
     frames: dict[int, list[TileScore]] = {}

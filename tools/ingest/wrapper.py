@@ -30,24 +30,29 @@ import sys
 
 from pipeline_progress import progress, run_with_progress
 
+EVAL_MANIFEST = ".eval_frames.json"
 EXTRACTOR_SCRIPT = "/workspace/360Extractor/src/main.py"
 CAMERAS_PER_FRAME_360 = 16
 PERSON_CLASS_ID = 0  # COCO class 0 = person
 
 
-def _filter_person_tiles(image_dir, confidence=0.6, min_area_frac=0.0):
+def _filter_person_tiles(image_dir, confidence=0.6, min_area_frac=0.0,
+                         skip_files=None):
     """Remove tiles where YOLO detects any person.
 
     Discards any image with a detected person — masks alone don't fully
     prevent artifacts from bilateral grid / camera optimizer confusion.
+
+    skip_files: set of filenames to skip (e.g. eval frames).
     """
     from ultralytics import YOLO
 
+    skip = skip_files or set()
     model = YOLO("yolov8m-seg.pt")
 
     files = sorted([
         os.path.join(image_dir, f) for f in os.listdir(image_dir)
-        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+        if f.lower().endswith(('.jpg', '.jpeg', '.png')) and f not in skip
     ])
 
     print(f"[PERSON-FILTER] Scanning {len(files)} tiles for persons...")
@@ -79,6 +84,95 @@ def _filter_person_tiles(image_dir, confidence=0.6, min_area_frac=0.0):
             print(f"[PERSON-FILTER] {i+1}/{len(files)} scanned, {deleted} removed")
 
     print(f"[PERSON-FILTER] Done: removed {deleted}/{len(files)} tiles with persons")
+
+
+def _select_eval_frames(scores, to_delete, output_dir, target_eval_pct=0.12):
+    """Select eval frames from discarded set for DiFix progressive shift.
+
+    Targets ~12% eval holdout (matching NVIDIA's test_every=8 = 12.5%).
+    Picks evenly-distributed discarded frames from gaps between training
+    frames. All tiles of a frame are kept together (360-aware).
+
+    Saves manifest to {output_dir}/../.eval_frames.json for train.py to read.
+    Returns list of eval frame file paths (to exclude from deletion).
+    """
+    delete_set = set(to_delete)
+    all_paths = set(s.path for s in scores)
+    kept_paths = all_paths - delete_set
+
+    # Group all tiles by frame
+    frames = {}
+    for s in scores:
+        frames.setdefault(s.frame_idx, []).append(s)
+
+    kept_frame_idxs = sorted(set(
+        s.frame_idx for s in scores if s.path in kept_paths
+    ))
+    discarded_frame_idxs = sorted(set(
+        s.frame_idx for s in scores if s.path in delete_set
+    ))
+
+    if len(kept_frame_idxs) < 2 or not discarded_frame_idxs:
+        print("[EVAL] Not enough frames for eval selection")
+        return []
+
+    # Target ~12% eval frames, evenly distributed across gaps
+    n_gaps = len(kept_frame_idxs) - 1
+    n_target_eval = max(3, round(len(kept_frame_idxs) * target_eval_pct))
+    eval_every_n = max(1, n_gaps // n_target_eval) if n_target_eval > 0 else n_gaps
+
+    eval_frame_idxs = []
+    for i in range(n_gaps):
+        # Pick evenly spaced gaps
+        if i % eval_every_n != eval_every_n // 2:
+            continue
+        if len(eval_frame_idxs) >= n_target_eval:
+            break
+
+        # Pick discarded frame closest to a training frame (not midpoint).
+        # Matches NVIDIA's test_every=8 pattern: eval cameras are near
+        # training cameras, minimizing parallax for DiFix ref images.
+        anchor = kept_frame_idxs[i]
+        best_idx = None
+        best_dist = float("inf")
+        for d_idx in discarded_frame_idxs:
+            if kept_frame_idxs[i] < d_idx < kept_frame_idxs[i + 1]:
+                dist = abs(d_idx - anchor)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = d_idx
+        if best_idx is not None:
+            eval_frame_idxs.append(best_idx)
+
+    if not eval_frame_idxs:
+        print("[EVAL] No suitable eval frames found in gaps")
+        return []
+
+    # Collect all tile paths for eval frames
+    eval_filenames = []
+    eval_paths = []
+    for fidx in eval_frame_idxs:
+        for tile in frames[fidx]:
+            eval_filenames.append(tile.filename)
+            eval_paths.append(tile.path)
+
+    # Write manifest
+    manifest_path = os.path.join(os.path.dirname(output_dir), EVAL_MANIFEST)
+    manifest = {
+        "eval_filenames": eval_filenames,
+        "eval_frame_indices": eval_frame_idxs,
+        "n_eval_frames": len(eval_frame_idxs),
+        "n_eval_tiles": len(eval_filenames),
+        "n_train_frames": len(kept_frame_idxs),
+    }
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"[EVAL] Selected {len(eval_frame_idxs)} eval frames "
+          f"({len(eval_filenames)} tiles) from gaps between training frames")
+    print(f"[EVAL] Manifest → {manifest_path}")
+
+    return eval_paths
 
 
 def flatten_processed_subdir(output_dir):
@@ -234,6 +328,8 @@ def main():
                         help="Output image format (default: jpg)")
     parser.add_argument("--quality", type=int, default=95,
                         help="JPEG quality (default: 95)")
+    parser.add_argument("--holdout", action="store_true",
+                        help="Select eval holdout frames from discards for quality metrics")
     args = parser.parse_args()
 
     progress("detecting_video", "running", 0, step=1, total_steps=1)
@@ -366,19 +462,51 @@ def main():
         scores = score_tiles(args.output)
         to_delete = select_and_prune(scores, target_count=args.target_images)
 
-        for path in to_delete:
-            os.remove(path)
+        # ── Save eval frames (only with --holdout) ─────────────
+        eval_paths = []
+        if args.holdout:
+            eval_paths = _select_eval_frames(scores, to_delete, args.output)
 
-        remaining = len(scores) - len(to_delete)
-        print(f"[SMART] Scored {len(scores)} tiles, kept {remaining}, "
-              f"deleted {len(to_delete)} low-quality tiles")
+        # Delete discarded frames (except eval frames)
+        eval_set = set(eval_paths)
+        n_deleted = 0
+        for path in to_delete:
+            if path not in eval_set:
+                os.remove(path)
+                n_deleted += 1
+
+        remaining = len(scores) - n_deleted
+        print(f"[SMART] Scored {len(scores)} tiles, kept {remaining} "
+              f"(train + {len(eval_paths)} eval), deleted {n_deleted}")
 
     # ── Post-selection person filtering (YOLO nano) ────────────
-    # Run ONLY on surviving tiles (after smart selection pruned to ~1.6x target).
-    # Much faster than running on all extracted frames.
+    # Run on ALL surviving tiles including eval. Eval frames with persons
+    # would artificially reduce quality metrics (model never sees persons,
+    # but GT image has them → PSNR/SSIM tanks). Remove affected eval
+    # frames from manifest after filtering.
     if is_360:
         progress("person_filter", "running", 0, step=1, total_steps=1)
         _filter_person_tiles(args.output)
+
+        # Update eval manifest: remove eval frames deleted by person filter
+        if smart_select and eval_paths:
+            _surviving = [p for p in eval_paths if os.path.exists(p)]
+            _removed = len(eval_paths) - len(_surviving)
+            if _removed > 0:
+                eval_paths = _surviving
+                # Rewrite manifest with surviving eval frames only
+                manifest_path = os.path.join(
+                    os.path.dirname(args.output), EVAL_MANIFEST)
+                if os.path.exists(manifest_path):
+                    _surviving_names = [os.path.basename(p) for p in _surviving]
+                    manifest = {
+                        "eval_filenames": _surviving_names,
+                        "n_eval_tiles": len(_surviving_names),
+                    }
+                    with open(manifest_path, "w") as mf:
+                        json.dump(manifest, mf, indent=2)
+                print(f"[EVAL] Removed {_removed} eval tiles with persons, "
+                      f"{len(_surviving)} remaining")
 
     progress("done", "completed", 100, step=1, total_steps=1)
 

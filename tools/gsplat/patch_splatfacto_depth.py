@@ -60,12 +60,27 @@ def patch_splatfacto_config(src):
     """Depth loss weight. 0 = disabled. Recommended: 0.1-0.5"""
     depth_loss_start_step: int = 500
     """Start depth loss after this many steps (let geometry settle first)"""
-    depth_weight_decay: float = 0.1
+    depth_weight_decay: float = 0.3
     """Decay depth weight to this fraction over depth_decay_steps. 1.0 = no decay."""
-    depth_decay_steps: int = 30000
+    depth_decay_steps: int = 50000
     """Steps over which depth weight decays (from depth_loss_start_step)."""
     normal_loss_mult: float = 0.0
     """Normal regularization weight (cosine distance). 0 = disabled. Recommended: 0.01-0.05"""
+    # Difix3D+ interleaved fix cycles
+    difix3d_enabled: bool = False
+    """Enable Difix3D+ fix cycles during training (novel-view enhancement)"""
+    difix3d_views: int = 36
+    """Number of novel views per fix cycle (~37 matches NVIDIA's val set size)"""
+    difix3d_lambda: float = 0.40
+    """Probability of novel data reuse per iteration between fix cycles"""
+    difix3d_tau: int = 200
+    """Difix noise level tau (NVIDIA default: 200). Higher = stronger correction."""
+    difix3d_total_iters: int = 30000
+    """Total training iterations for DiFix schedule (set from --iterations)"""
+    difix3d_tiles_per_frame: int = 16
+    """Tiles per frame for 360 cameras (1 = regular cameras, 16 = 360 rig)"""
+    difix3d_eval_poses_path: str = ""
+    """Path to eval_cameras.pt with held-out camera poses for progressive shift"""
 '''
 
     src = src[:insert_after] + new_fields + src[insert_after:]
@@ -490,6 +505,147 @@ def patch_lazy_cache(path):
     print("[PATCH H] Added lazy image + depth loading to FullImageDatamanager")
 
 
+def patch_splatfacto_difix(src):
+    """Patch K: DiFix3D+ interleaved fix cycles + novel data reuse.
+
+    Injects at the end of get_loss_dict (before return loss_dict):
+      - Lazy initialization of DiFix pipeline, novel pool, and schedule
+      - Phase 1: Fix cycles at scheduled steps (render + enhance + store)
+      - Phase 2: Novel data reuse (probabilistic extra gradient step)
+
+    Gradients accumulate on gauss_params; the main training loop's
+    optimizer.step() applies them together with the normal training gradients.
+    """
+
+    # Anchor: end of get_loss_dict (after depth/normal code from Patch C)
+    anchor = (
+        '                                  f"loss={_n_loss.item():.4f}")\n'
+        '\n'
+        '        return loss_dict'
+    )
+
+    if anchor not in src:
+        # Fallback: try without the normal loss print (if depth patch structure changed)
+        anchor = '        return loss_dict'
+        # Find the LAST occurrence (end of get_loss_dict)
+        last_idx = src.rfind(anchor)
+        if last_idx == -1:
+            print("[PATCH K] ERROR: Could not find return loss_dict anchor")
+            return src
+        # Replace only the last occurrence
+        difix_code = _get_difix_code()
+        src = src[:last_idx] + difix_code + '\n        return loss_dict' + src[last_idx + len(anchor):]
+        print("[PATCH K] Added DiFix3D+ fix cycles + novel reuse (fallback anchor)")
+        return src
+
+    difix_code = _get_difix_code()
+    replacement = (
+        '                                  f"loss={_n_loss.item():.4f}")\n'
+        '\n'
+        + difix_code +
+        '\n        return loss_dict'
+    )
+
+    src = src.replace(anchor, replacement, 1)
+    print("[PATCH K] Added DiFix3D+ fix cycles + novel reuse")
+    return src
+
+
+def _get_difix_code():
+    """Return the DiFix3D+ code block for injection into get_loss_dict."""
+    return (
+        '        # ── DiFix3D+ interleaved fix cycles (Patch K) ──\n'
+        '        # Phase 1: At scheduled steps, render novel views, enhance with Difix,\n'
+        '        #          store in pool. Phase 2: Between fix steps, probabilistically\n'
+        '        #          train on pooled novel views (extra gradient accumulation).\n'
+        '        if self.training and self.config.difix3d_enabled:\n'
+        '            # Upweight real training loss 1.5x (NVIDIA approach) to prevent\n'
+        '            # model from drifting toward DiFix hallucinations.\n'
+        '            for _k in loss_dict:\n'
+        '                loss_dict[_k] = loss_dict[_k] * 1.5\n'
+        '\n'
+        '            # Save rasterization state — DiFix calls get_outputs() on novel\n'
+        '            # cameras which overwrites self.info and self.xys. Must restore\n'
+        '            # so step_post_backward (MCMC densification) sees correct state.\n'
+        '            # Shallow dict copy + detach tensors to avoid graph reference issues.\n'
+        '            # deepcopy fails on non-leaf tensors in the computation graph.\n'
+        '            _saved_info = {k: (v.detach().clone() if torch.is_tensor(v) else v)\n'
+        '                           for k, v in self.info.items()} if hasattr(self, "info") and self.info else None\n'
+        '            _saved_xys = self.xys.detach().clone() if hasattr(self, "xys") and self.xys is not None else None\n'
+        '\n'
+        '            # Lazy init (first call only)\n'
+        '            if not hasattr(self, "_difix_pipe"):\n'
+        '                from difix_integration import (\n'
+        '                    init_difix, compute_difix_schedule, ProgressiveShifter,\n'
+        '                )\n'
+        '                self._difix_pipe = init_difix("cpu")\n'
+        '                self._difix_pool = []\n'
+        '                self._difix_shifter = None  # created when datamanager available\n'
+        '                _sched = compute_difix_schedule(\n'
+        '                    total_iters=self.config.difix3d_total_iters,\n'
+        '                    views_per_cycle=self.config.difix3d_views,\n'
+        '                )\n'
+        '                self._difix_schedule = set(_sched)\n'
+        '                self._difix_first_fix = min(_sched)\n'
+        '                print(f"[DIFIX] Fix cycles at: {sorted(self._difix_schedule)}")\n'
+        '                print(f"[DIFIX] Novel reuse lambda: {self.config.difix3d_lambda}")\n'
+        '\n'
+        '            # Phase 1: Fix cycle — render + enhance + store novel views\n'
+        '            if self.step in self._difix_schedule:\n'
+        '                from difix_integration import difix_fix_step\n'
+        '                # Access datamanager via pipeline (set by nerfstudio trainer)\n'
+        '                _dm = getattr(self, "_difix_datamanager", None)\n'
+        '                if _dm is None:\n'
+        '                    # Find datamanager by walking the call stack.\n'
+        '                    # Nerfstudio trainer calls pipeline.get_train_loss_dict_and_metrics()\n'
+        '                    # which calls model.get_loss_dict(). The pipeline is in a parent frame.\n'
+        '                    import inspect as _inspect\n'
+        '                    for _frame_info in _inspect.stack():\n'
+        '                        _self_var = _frame_info.frame.f_locals.get("self")\n'
+        '                        if _self_var is not None and hasattr(_self_var, "datamanager"):\n'
+        '                            _dm = _self_var.datamanager\n'
+        '                            self._difix_datamanager = _dm\n'
+        '                            break\n'
+        '                    del _frame_info  # avoid reference cycle\n'
+        '                if _dm is not None:\n'
+        '                    if self._difix_shifter is None:\n'
+        '                        from difix_integration import ProgressiveShifter\n'
+        '                        self._difix_shifter = ProgressiveShifter(\n'
+        '                            _dm.train_dataset.cameras,\n'
+        '                            tiles_per_frame=self.config.difix3d_tiles_per_frame,\n'
+        '                            eval_poses_path=self.config.difix3d_eval_poses_path,\n'
+        '                        )\n'
+        '                    difix_fix_step(\n'
+        '                        model=self, datamanager=_dm,\n'
+        '                        difix_pipe=self._difix_pipe,\n'
+        '                        novel_pool=self._difix_pool,\n'
+        '                        shifter=self._difix_shifter,\n'
+        '                        n_views=self.config.difix3d_views,\n'
+        '                        difix_tau=self.config.difix3d_tau,\n'
+        '                        step=self.step,\n'
+        '                    )\n'
+        '                else:\n'
+        '                    print("[DIFIX] WARNING: Could not find datamanager")\n'
+        '\n'
+        '            # Phase 2: Novel data reuse (probabilistic extra gradient)\n'
+        '            if (self._difix_pool\n'
+        '                    and self.step >= self._difix_first_fix\n'
+        '                    and torch.rand(1).item() < self.config.difix3d_lambda):\n'
+        '                from difix_integration import difix_novel_step\n'
+        '                difix_novel_step(\n'
+        '                    model=self,\n'
+        '                    novel_pool=self._difix_pool,\n'
+        '                )\n'
+        '\n'
+        '            # Restore rasterization state so step_post_backward sees\n'
+        '            # the training camera state, not the novel camera state.\n'
+        '            if _saved_info is not None:\n'
+        '                self.info = _saved_info\n'
+        '            if _saved_xys is not None:\n'
+        '                self.xys = _saved_xys\n'
+    )
+
+
 def main():
     splatfacto_path = find_splatfacto()
     print(f"Patching: {splatfacto_path}")
@@ -502,6 +658,7 @@ def main():
     src = patch_splatfacto_scale_clamp(src)
     src = patch_splatfacto_pruning(src)
     src = patch_splatfacto_diagnostics(src)
+    src = patch_splatfacto_difix(src)
 
     with open(splatfacto_path, 'w') as f:
         f.write(src)
