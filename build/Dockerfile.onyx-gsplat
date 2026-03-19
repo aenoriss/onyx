@@ -30,7 +30,29 @@ hf_hub_download('depth-anything/Depth-Anything-V2-Large', 'depth_anything_v2_vit
 print('DAv2 weights downloaded') \
 "
 
-# Patch splatfacto: add depth supervision loss (Pearson correlation)
+# ── DiFix3D+ dependencies ─────────────────────────────────────────────────────
+# Pinned versions required by DiFix3D+ (newer diffusers breaks FromOriginalVAEMixin)
+# scipy is needed for rotation SLERP in camera interpolation
+RUN pip install --no-cache-dir \
+    "diffusers==0.25.1" \
+    "peft==0.9.0" \
+    "huggingface-hub==0.25.1" \
+    "transformers==4.38.0" \
+    scipy \
+    einops
+
+# Clone DiFix3D repository (provides pipeline_difix.py used by difix_integration.py)
+RUN git clone --depth 1 https://github.com/nv-tlabs/Difix3D.git /workspace/Difix3D
+ENV PYTHONPATH="/workspace/Difix3D/src:${PYTHONPATH}"
+
+# HuggingFace model cache
+ENV HF_HOME=/workspace/.hf_cache
+
+# Pre-download DiFix3D+ model (~2 GB fp16) so runtime doesn't need internet
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('nvidia/difix_ref')"
+RUN mkdir -p /workspace/.hf_cache && chmod -R 777 /workspace/.hf_cache
+
+# Patch splatfacto: add depth supervision + DiFix3D+ integration
 COPY tools/gsplat/patch_splatfacto_depth.py /workspace/patch_splatfacto_depth.py
 RUN python /workspace/patch_splatfacto_depth.py
 
@@ -42,9 +64,10 @@ from gsplat.cuda._backend import _C; print('gsplat kernels:', _C); \
 from nerfstudio.models.splatfacto import SplatfactoModel; print('splatfacto ready'); \
 "
 
-# Copy training wrapper + depth generation script
+# Copy training wrapper, depth generation, and DiFix integration
 COPY tools/gsplat/train.py /workspace/train.py
 COPY tools/gsplat/generate_depths.py /workspace/generate_depths.py
+COPY tools/gsplat/difix_integration.py /workspace/difix_integration.py
 
 # Disable torch inductor JIT compilation (avoids ~10 min cold start per container)
 # Falls back to pre-compiled CUDA kernels (gsplat, PyTorch). ~10-20% slower per iteration

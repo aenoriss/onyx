@@ -60,9 +60,9 @@ def patch_splatfacto_config(src):
     """Depth loss weight. 0 = disabled. Recommended: 0.1-0.5"""
     depth_loss_start_step: int = 500
     """Start depth loss after this many steps (let geometry settle first)"""
-    depth_weight_decay: float = 0.3
+    depth_weight_decay: float = 0.1
     """Decay depth weight to this fraction over depth_decay_steps. 1.0 = no decay."""
-    depth_decay_steps: int = 50000
+    depth_decay_steps: int = 30000
     """Steps over which depth weight decays (from depth_loss_start_step)."""
     normal_loss_mult: float = 0.0
     """Normal regularization weight (cosine distance). 0 = disabled. Recommended: 0.01-0.05"""
@@ -81,6 +81,12 @@ def patch_splatfacto_config(src):
     """Tiles per frame for 360 cameras (1 = regular cameras, 16 = 360 rig)"""
     difix3d_eval_poses_path: str = ""
     """Path to eval_cameras.pt with held-out camera poses for progressive shift"""
+    # DropGaussian disabled — fixed rate hurts dense-view convergence.
+    # Paper designed for sparse-view (3-8 images), our 433 images don't overfit.
+    drop_gaussian_rate: float = 0.0
+    """Fraction of Gaussians to drop per training step (0 = disabled)."""
+    drop_gaussian_start: int = 1000
+    """Start DropGaussian after this many steps (warmup)"""
 '''
 
     src = src[:insert_after] + new_fields + src[insert_after:]
@@ -646,6 +652,57 @@ def _get_difix_code():
     )
 
 
+def patch_splatfacto_dropgaussian(src):
+    """Patch L: DropGaussian — random opacity dropout to prevent floaters (CVPR 2025).
+
+    During training, randomly sets a fraction of Gaussians to transparent
+    before rasterization. Forces the model to not rely on floaters.
+    Injected right before the rasterization call.
+    """
+    anchor = '            opacities_crop = self.opacities\n'
+
+    if anchor not in src:
+        print("[PATCH L] WARNING: opacities_crop anchor not found, skipping DropGaussian")
+        return src
+
+    drop_code = (
+        '            opacities_crop = self.opacities\n'
+        '\n'
+        '            # ── DropGaussian (CVPR 2025): random opacity dropout ──\n'
+        '            # Prevents floater formation by forcing Gaussian independence.\n'
+        '            # Dropped Gaussians are temporarily invisible, forcing neighbors\n'
+        '            # to explain the scene without backup from co-adapted floaters.\n'
+        '            if (self.training\n'
+        '                    and self.config.drop_gaussian_rate > 0\n'
+        '                    and self.step >= self.config.drop_gaussian_start):\n'
+        '                _drop_mask = torch.rand(\n'
+        '                    opacities_crop.shape[0], 1,\n'
+        '                    device=opacities_crop.device\n'
+        '                ) > self.config.drop_gaussian_rate\n'
+        '                # In logit space: set dropped Gaussians to sigmoid(-10) ≈ 0\n'
+        '                opacities_crop = torch.where(\n'
+        '                    _drop_mask, opacities_crop,\n'
+        '                    torch.full_like(opacities_crop, -10.0))\n'
+    )
+
+    src = src.replace(anchor, drop_code, 1)
+    print("[PATCH L] Added DropGaussian opacity dropout")
+    return src
+
+
+def patch_splatfacto_visibility_pruning(src):
+    """Patch N: DISABLED — visibility pruning causes relocation churn.
+
+    Escalating floater count (44→176→228→256) suggests model recreates
+    floaters faster than pruning removes them. The constant relocation
+    disrupts optimization without net benefit.
+    """
+    print("[PATCH N] Skipped (visibility pruning disabled — causes relocation churn)")
+    return src
+
+
+
+
 def main():
     splatfacto_path = find_splatfacto()
     print(f"Patching: {splatfacto_path}")
@@ -659,6 +716,7 @@ def main():
     src = patch_splatfacto_pruning(src)
     src = patch_splatfacto_diagnostics(src)
     src = patch_splatfacto_difix(src)
+    src = patch_splatfacto_dropgaussian(src)
 
     with open(splatfacto_path, 'w') as f:
         f.write(src)

@@ -36,7 +36,7 @@ CAMERAS_PER_FRAME_360 = 16
 PERSON_CLASS_ID = 0  # COCO class 0 = person
 
 
-def _filter_person_tiles(image_dir, confidence=0.6, min_area_frac=0.0,
+def _filter_person_tiles(image_dir, confidence=0.85, min_area_frac=0.01,
                          skip_files=None):
     """Remove tiles where YOLO detects any person.
 
@@ -57,6 +57,8 @@ def _filter_person_tiles(image_dir, confidence=0.6, min_area_frac=0.0,
 
     print(f"[PERSON-FILTER] Scanning {len(files)} tiles for persons...")
     deleted = 0
+    rejected_dir = os.path.join(image_dir, "..", "rejected_persons")
+    os.makedirs(rejected_dir, exist_ok=True)
 
     for i, filepath in enumerate(files):
         results = model(filepath, verbose=False)
@@ -72,11 +74,12 @@ def _filter_person_tiles(image_dir, confidence=0.6, min_area_frac=0.0,
             conf = float(box.conf[0])
             if cls_id != PERSON_CLASS_ID or conf < confidence:
                 continue
-            # Check if person occupies significant area
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             box_area = (x2 - x1) * (y2 - y1)
             if box_area / img_area >= min_area_frac:
-                os.remove(filepath)
+                fname = os.path.basename(filepath)
+                shutil.move(filepath, os.path.join(rejected_dir, fname))
+                print(f"[PERSON-FILTER] {fname}: conf={conf:.2f} area={box_area/img_area*100:.1f}%")
                 deleted += 1
                 break
 
@@ -369,10 +372,11 @@ def main():
             print("[ERROR] Could not determine video duration")
             sys.exit(1)
 
-        # Smart selection: over-extract at 1fps, prune after scoring
-        # 1fps is industry standard for overextraction (COLMAP, nerfstudio, RealityCapture)
-        # 360 video captures full surroundings per frame, so 1fps provides ample redundancy
-        interval = 1.0  # 1fps oversampling
+        # Smart selection: over-extract at 1.6fps (1 frame every 0.625s)
+        # Denser sampling gives more candidates for smart selection.
+        # Matches the effective extraction rate of a 1.6x slowed video at 1fps:
+        # slowed video stretches time → 1fps captures every 0.625s of real footage.
+        interval = 0.625  # every 0.625s — replicates 1.6x slow video effect
         cameras = CAMERAS_PER_FRAME_360 if is_360 else 1
         target_frames = max(1, args.target_images // cameras)
         oversampled_frames = int(duration / interval)
@@ -460,7 +464,16 @@ def main():
         progress("scoring_tiles", "running", 0, step=1, total_steps=1)
         print("[SMART] Scoring tiles with SIFT features...")
         scores = score_tiles(args.output)
-        to_delete = select_and_prune(scores, target_count=args.target_images)
+        # max_gap must satisfy two constraints:
+        # 1. Time-based: ~8 seconds of real camera movement between force-keeps
+        # 2. Budget-based: gap must be large enough to allow reaching target frame count
+        # Use the larger to ensure budget is always achievable.
+        time_gap = max(8, round(8.0 / interval))
+        target_frames_est = max(1, args.target_images // cameras)
+        budget_gap = max(8, oversampled_frames // target_frames_est)
+        adaptive_max_gap = max(time_gap, budget_gap)
+        to_delete = select_and_prune(scores, target_count=args.target_images,
+                                     max_gap=adaptive_max_gap)
 
         # ── Save eval frames (only with --holdout) ─────────────
         eval_paths = []

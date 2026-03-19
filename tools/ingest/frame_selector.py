@@ -185,7 +185,7 @@ def _pick_reference_camera(scores):
 def select_and_prune(
     scores: list[TileScore],
     target_count: int,
-    min_sift: int = 80,
+    min_sift: int = 40,
     min_frames_keep: int = 10,
     max_overlap: float = 0.45,
     max_gap: int = 8,
@@ -213,9 +213,21 @@ def select_and_prune(
 
     n_featureless = sum(1 for s in scores if s.sift_count < min_sift)
 
+    # Filter blurry tiles (Laplacian variance threshold)
+    # Sharp images: >100, moderate: 50-100, blurry: <50
+    # Use relative threshold: bottom 10% of sharpness distribution
+    if scores:
+        sharpness_vals = sorted(s.sharpness for s in scores)
+        sharpness_p10 = sharpness_vals[len(sharpness_vals) // 10]
+        min_sharpness = max(sharpness_p10, 30.0)  # at least 30, or p10
+        n_blurry = sum(1 for s in scores if s.sharpness < min_sharpness)
+    else:
+        min_sharpness = 30.0
+        n_blurry = 0
+
     keep_budget = target_count
     print(f"[SELECT] {len(scores)} total, {n_featureless} featureless "
-          f"(< {min_sift} SIFT)")
+          f"(< {min_sift} SIFT), {n_blurry} blurry (sharpness < {min_sharpness:.0f})")
     print(f"[SELECT] Budget: {keep_budget} tiles (target {target_count})")
 
     # Group ALL tiles by frame
@@ -264,7 +276,9 @@ def select_and_prune(
         for fidx, tiles in frames.items():
             ref_tiles[fidx] = max(tiles, key=lambda t: t.sift_count)
 
-    avg_tiles_per_frame = len(scores) / n_frames_total
+    # Estimate target frames for overlap pass (rough, using raw tile count).
+    # Accurate count computed after per-tile filtering on kept frames only.
+    avg_tiles_per_frame = len(scores) / max(n_frames_total, 1)
     target_frames = max(min_frames_keep, int(keep_budget / max(avg_tiles_per_frame, 1)))
 
     if target_frames >= n_frames_total:
@@ -309,10 +323,78 @@ def select_and_prune(
     print(f"[SELECT] Overlap pass: {len(kept_frame_idxs)}/{n_frames_total} frames "
           f"kept in {elapsed:.1f}s")
 
-    # ── Adapt overlap threshold if we have too many/few frames ──
-    # If overlap selection gave us way more frames than budget, tighten threshold
-    # If way fewer, loosen. Do one adjustment pass.
+    # ── Per-tile filter on KEPT frames only ──────────────────
+    # Filter featureless/blurry tiles only from frames selected by overlap.
+    # More efficient than filtering all frames (only ~half survive overlap).
+    n_featureless_dropped = 0
+    n_blurry_dropped = 0
+    for fidx in list(kept_frame_idxs):
+        surviving = []
+        for t in frames[fidx]:
+            if t.sift_count < min_sift:
+                n_featureless_dropped += 1
+            elif t.sharpness < min_sharpness:
+                n_blurry_dropped += 1
+            else:
+                surviving.append(t)
+        if surviving:
+            frames[fidx] = surviving
+        else:
+            # Frame has zero surviving tiles — remove from kept
+            kept_frame_idxs.remove(fidx)
+
+    if n_featureless_dropped:
+        print(f"[SELECT] Filtered {n_featureless_dropped} featureless tiles "
+              f"(< {min_sift} SIFT) from kept frames")
+    if n_blurry_dropped:
+        print(f"[SELECT] Filtered {n_blurry_dropped} blurry tiles "
+              f"(sharpness < {min_sharpness:.0f}) from kept frames")
+
+    # ── Motion blur detection on KEPT frames ────────────────
+    # Kept frames are spaced apart (10+ seconds), so a blurry frame
+    # stands out against sharp neighbors. Checks reference camera tile
+    # sharpness across kept frames with a 5-frame sliding window.
+    # Rejects frames below 60% of local median → camera jolt.
+    _window = 5
+    _blur_threshold = 0.6
+    _blur_rejected = 0
+    if len(kept_frame_idxs) > _window:
+        _kept_sharpness = []
+        for fidx in kept_frame_idxs:
+            # Use reference camera tile, or best surviving tile if ref was filtered
+            if fidx in ref_tiles:
+                _kept_sharpness.append(ref_tiles[fidx].sharpness)
+            elif frames.get(fidx):
+                _kept_sharpness.append(max(t.sharpness for t in frames[fidx]))
+            else:
+                _kept_sharpness.append(0)
+
+        _to_remove = []
+        for i in range(len(kept_frame_idxs)):
+            lo = max(0, i - _window // 2)
+            hi = min(len(kept_frame_idxs), i + _window // 2 + 1)
+            if hi - lo < 3:
+                continue
+            neighbors = sorted(_kept_sharpness[lo:hi])
+            local_median = neighbors[len(neighbors) // 2]
+            if local_median > 0 and _kept_sharpness[i] < local_median * _blur_threshold:
+                _to_remove.append(kept_frame_idxs[i])
+
+        for fidx in _to_remove:
+            kept_frame_idxs.remove(fidx)
+            _blur_rejected += 1
+
+        if _blur_rejected:
+            print(f"[SELECT] Motion blur: rejected {_blur_rejected} blurry kept frames")
+
+    # Recompute accurate tile counts and target after filtering
     kept_tiles_count = sum(len(frames[f]) for f in kept_frame_idxs)
+    avg_tiles_per_frame = kept_tiles_count / max(len(kept_frame_idxs), 1)
+    target_frames = max(min_frames_keep, int(keep_budget / max(avg_tiles_per_frame, 1)))
+    print(f"[SELECT] {kept_tiles_count} tiles across {len(kept_frame_idxs)} frames "
+          f"(avg {avg_tiles_per_frame:.1f}/frame, target {target_frames} frames)")
+
+    # ── Budget trim/fill using accurate tile counts ────────
 
     if kept_tiles_count > keep_budget * 1.3 and len(kept_frame_idxs) > target_frames:
         # Too many frames — score and drop worst frames until within budget
@@ -327,10 +409,20 @@ def select_and_prune(
             ) / len(tiles)
             frame_quality[fidx] = composite
 
-        # Sort by quality, remove lowest quality frames until within budget
-        # But never remove first or last frame (boundary coverage)
-        # And never create a gap > max_gap between remaining kept frames
-        removable = sorted(kept_frame_idxs[1:-1], key=lambda f: frame_quality[f])
+        # Sort by quality × spacing, remove from dense clusters first.
+        # Protects isolated frames even if lower quality, drops from
+        # clusters where neighbors can compensate. Never removes first/last.
+        def _drop_score(fidx):
+            """Lower score = more likely to drop."""
+            idx_in_kept = kept_frame_idxs.index(fidx)
+            gap_before = fidx - kept_frame_idxs[idx_in_kept - 1] if idx_in_kept > 0 else max_gap
+            gap_after = kept_frame_idxs[idx_in_kept + 1] - fidx if idx_in_kept < len(kept_frame_idxs) - 1 else max_gap
+            min_gap_val = min(gap_before, gap_after)
+            spacing = min(min_gap_val / max_gap, 1.0)  # 0=dense cluster, 1=isolated
+            quality = frame_quality[fidx] / (max(frame_quality.values()) or 1.0)
+            return quality * 0.6 + spacing * 0.4
+
+        removable = sorted(kept_frame_idxs[1:-1], key=_drop_score)
         while kept_tiles_count > keep_budget and removable:
             drop_fidx = removable.pop(0)
             # Check if dropping this frame would create a coverage gap
@@ -353,50 +445,48 @@ def select_and_prune(
         unkept = [f for f in sorted_frame_idxs if f not in kept_set]
         max_sharpness = max(s.sharpness for s in scores) or 1.0
 
-        # Score unkept frames
-        unkept_scored = []
-        for fidx in unkept:
+        # Score unkept frames by quality × gap-filling value.
+        # Prefer adding frames that fill the widest gaps between kept frames.
+        def _fill_score(fidx):
+            """Higher = better candidate to fill."""
             tiles = frames[fidx]
-            composite = sum(
+            quality = sum(
                 t.sift_count * 0.7 + (t.sharpness / max_sharpness) * 1000 * 0.3
                 for t in tiles
             ) / len(tiles)
-            unkept_scored.append((fidx, composite))
-        unkept_scored.sort(key=lambda x: -x[1])  # best first
+            # Find which gap this frame would fill
+            import bisect
+            pos = bisect.bisect_left(kept_frame_idxs, fidx)
+            if pos == 0:
+                gap = kept_frame_idxs[0] - fidx
+            elif pos >= len(kept_frame_idxs):
+                gap = fidx - kept_frame_idxs[-1]
+            else:
+                gap = kept_frame_idxs[pos] - kept_frame_idxs[pos - 1]
+            gap_score = min(gap / max_gap, 1.0)  # larger gap = higher priority
+            max_q = max((sum(t.sift_count for t in frames[f]) / len(frames[f])
+                        for f in unkept), default=1.0)
+            return (quality / (max_q or 1.0)) * 0.4 + gap_score * 0.6
 
-        for fidx, _ in unkept_scored:
+        unkept_scored = sorted(unkept, key=_fill_score, reverse=True)
+
+        for fidx in unkept_scored:
             if kept_tiles_count >= keep_budget:
                 break
             kept_frame_idxs.append(fidx)
+            kept_frame_idxs.sort()  # keep sorted for gap calculation
             kept_tiles_count += len(frames[fidx])
 
         kept_frame_idxs.sort()
         print(f"[SELECT] After gap fill: {len(kept_frame_idxs)} frames, "
               f"~{kept_tiles_count} tiles")
 
-    # Collect tiles from kept frames, excluding featureless tiles
+    # Collect all tiles from kept frames (already filtered)
     kept_set = set(kept_frame_idxs)
     kept_tiles = set()
-    n_featureless_dropped = 0
     for fidx in kept_set:
         for t in frames[fidx]:
-            if t.sift_count < min_sift:
-                n_featureless_dropped += 1
-            else:
-                kept_tiles.add(t.path)
-    if n_featureless_dropped:
-        print(f"[SELECT] Dropped {n_featureless_dropped} featureless tiles "
-              f"(< {min_sift} SIFT features)")
-
-    # If still over budget, drop lowest-scoring individual tiles
-    if len(kept_tiles) > keep_budget:
-        kept_list = []
-        for fidx in kept_set:
-            kept_list.extend(frames[fidx])
-        kept_list.sort(key=lambda t: t.sift_count)
-        while len(kept_tiles) > keep_budget and kept_list:
-            drop = kept_list.pop(0)
-            kept_tiles.discard(drop.path)
+            kept_tiles.add(t.path)
 
     # Build delete list
     to_delete = []

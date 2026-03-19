@@ -102,17 +102,17 @@ TARGET_IMAGES = {
     ("outdoor", "proto"):      150,
     ("outdoor", "yono"):       150,
     ("outdoor", "dense"):      450,
-    ("indoor",  "production"): 480,
+    ("indoor",  "production"): 580,
     ("indoor",  "proto"):      100,
     ("indoor",  "yono"):       100,
-    ("indoor",  "dense"):      480,
+    ("indoor",  "dense"):      580,
 }
 
 RECONSTRUCTION_CONTAINER = {
     ("gaussian", "production"):       "onyx-milo",
     ("gaussian", "proto"):            "onyx-gsplat",
     ("gaussian", "yono"):             "onyx-yonosplat",
-    ("gaussian", "dense"):            "onyx-gsplat",    # TEMP: gsplat+MCMC instead of MILo
+    ("gaussian", "dense"):            "onyx-milo",
     ("photogrammetry", "production"): "onyx-openmvs",
     ("photogrammetry", "proto"):      "onyx-openmvs",
 }
@@ -842,6 +842,8 @@ def step_sfm(config, state, output_dir, dry_run=False):
     if config.get("colmap_mapper", False):
         cmd.append("--colmap-mapper")
 
+    cmd += ["--video-type", config.get("video", "normal")]
+
     run_docker(cmd, "SFM", state, output_dir, dry_run)
 
 
@@ -866,8 +868,10 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
     elif mode == "gaussian" and quality == "yono":
         _run_yonosplat(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "dense":
-        _run_gsplat(config, state, output_dir, dry_run,
-                    init_pcd="/data/output/openmvs/scene_dense.ply")
+        # _run_gsplat(config, state, output_dir, dry_run,
+        #             init_pcd="/data/output/openmvs/scene_dense.ply")
+        _run_milo(config, state, output_dir, dry_run,
+                  init_pcd="/data/output/openmvs/scene_dense.ply")
     elif mode == "photogrammetry":
         _run_openmvs(config, state, output_dir, dry_run)
 
@@ -1766,7 +1770,7 @@ def main():
             "is_images_input": is_images_input,
             "local": args.local,
             "segment": args.segment,
-            "mask_classes": args.mask_classes,
+            "mask_classes": args.mask_classes or ("person" if args.scene == "indoor" else None),
             "difix3d": args.difix3d,
             "bilateral_grid": args.bilateral_grid,
             "depth": args.depth,

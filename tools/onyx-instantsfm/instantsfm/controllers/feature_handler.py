@@ -15,30 +15,39 @@ def PairId2Ids(pair_id):
 def Ids2PairId(id1, id2):
     return (id1 * C_MAX_INT + id2 if id1 < id2 else id2 * C_MAX_INT + id1)
 
-def GenerateDatabase(image_path, database_path, feature_handler_name, config, single_camera=False, camera_per_folder=False):
+def GenerateDatabase(image_path, database_path, feature_handler_name, config, single_camera=False, camera_per_folder=False, video_type='normal'):
     # colmap support from command line. ensure colmap is installed
     if feature_handler_name == 'colmap':
         import subprocess
         from PIL import Image
         colmap_env = os.environ.copy()
-        # Compute PINHOLE intrinsics from first image (assumes 90° FOV, square pixels)
-        first_image = next(f for f in os.listdir(image_path) if f.lower().endswith(('.jpg', '.png', '.jpeg')))
-        img = Image.open(os.path.join(image_path, first_image))
-        w, h = img.size
-        fx = w / 2.0  # 90° FOV: f = w / (2 * tan(45°)) = w / 2
-        fy = h / 2.0
-        cx, cy = w / 2.0, h / 2.0
-        camera_params = f'{fx},{fy},{cx},{cy}'
-        print(f"Computed PINHOLE intrinsics from {w}x{h} image (90° FOV): {camera_params}")
         feature_extractor_cmd = [
             'colmap', 'feature_extractor',
             '--image_path', image_path,
             '--database_path', database_path,
-            '--ImageReader.camera_model', 'PINHOLE',
-            '--ImageReader.camera_params', camera_params,
             '--ImageReader.single_camera', '1' if single_camera else '0',
             '--ImageReader.single_camera_per_folder', '1' if (not single_camera and camera_per_folder) else '0',
         ]
+        if video_type == '360':
+            # Cubemap faces always have 90° FOV — hardcode PINHOLE intrinsics
+            first_image = next(f for f in os.listdir(image_path) if f.lower().endswith(('.jpg', '.png', '.jpeg')))
+            img = Image.open(os.path.join(image_path, first_image))
+            w, h = img.size
+            fx = w / 2.0  # 90° FOV: f = w / (2 * tan(45°)) = w / 2
+            fy = h / 2.0
+            cx, cy = w / 2.0, h / 2.0
+            camera_params = f'{fx},{fy},{cx},{cy}'
+            print(f"Computed PINHOLE intrinsics from {w}x{h} cubemap face (90° FOV): {camera_params}")
+            feature_extractor_cmd += [
+                '--ImageReader.camera_model', 'PINHOLE',
+                '--ImageReader.camera_params', camera_params,
+            ]
+        else:
+            # Normal video: let COLMAP estimate intrinsics (SIMPLE_RADIAL handles lens distortion)
+            print(f"Normal video: using COLMAP automatic intrinsic estimation (SIMPLE_RADIAL)")
+            feature_extractor_cmd += [
+                '--ImageReader.camera_model', 'SIMPLE_RADIAL',
+            ]
         exhaustive_matcher_cmd = [
             'colmap', 'exhaustive_matcher',
             '--database_path', database_path,

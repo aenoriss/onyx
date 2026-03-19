@@ -27,6 +27,8 @@ def main():
                              "Disable with --no-colmap-mapper for InstantSfM global mapper.")
     parser.add_argument("--no-colmap-mapper", dest="colmap_mapper", action="store_false",
                         help="Use InstantSfM global mapper instead of COLMAP")
+    parser.add_argument("--video-type", choices=["normal", "360"], default="normal",
+                        help="Video type: normal uses automatic intrinsics, 360 uses fixed 90° FOV")
     args = parser.parse_args()
 
     total_steps = 2
@@ -40,7 +42,7 @@ def main():
     }
 
     run_with_progress(
-        ["ins-feat", "--data_path", args.data_path, "--single_camera"],
+        ["ins-feat", "--data_path", args.data_path, "--single_camera", "--video-type", args.video_type],
         stage="feature_extraction",
         step=1, total_steps=total_steps,
         patterns=feat_patterns,

@@ -696,7 +696,7 @@ def main():
     print(f"Depth:     {'DAv2 (weight=' + str(args.depth_weight) + ')' if args.depth else 'No'}")
     # Normal loss defaults to 0.02 when depth is enabled
     if args.normal_weight is None:
-        args.normal_weight = 0.05 if args.depth else 0.0
+        args.normal_weight = 0.02 if args.depth else 0.0
     print(f"Normals:   {'weight=' + str(args.normal_weight) if args.normal_weight > 0 else 'No'}")
     print(f"DiFix3D+:  {'Yes (views=' + str(args.difix3d_views) + ', tau=' + str(args.difix3d_tau) + ')' if args.difix3d else 'No'}")
     print(f"CamOptim:  SO3xR3")
@@ -750,7 +750,7 @@ def main():
         "--pipeline.model.use-bilateral-grid", str(args.bilateral_grid),
         # Gaussian cap — 500K with depth (MCMC never prunes, excess are dead weight
         # that inflate isect_tiles buffer → OOM spikes). 1M without depth.
-        "--pipeline.model.max-gs-num", str(args.max_gs_num or 1000000),
+        "--pipeline.model.max-gs-num", str(args.max_gs_num or 500000),
         # Learn pose corrections from SfM imprecision
         "--pipeline.model.camera-optimizer.mode", "SO3xR3",
         # Depth supervision (Depth Anything V2 priors)
