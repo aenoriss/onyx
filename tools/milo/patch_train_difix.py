@@ -54,8 +54,8 @@ _P1_NEW = (
     '        help="Probability of novel data reuse per iteration (default: 0.40)",\n'
     '    )\n'
     '    parser.add_argument(\n'
-    '        "--difix3d_tau", type=int, default=400,\n'
-    '        help="Difix noise level tau (default: 400; paper default: 200)",\n'
+    '        "--difix3d_tau", type=int, default=200,\n'
+    '        help="Difix noise level tau (default: 200; NVIDIA paper default)",\n'
     '    )'
 )
 
@@ -90,7 +90,7 @@ _P2_NEW = (
     '        _difix_pipe = init_difix("cuda")\n'
     '        _difix_views = getattr(args, "difix3d_views", 48)\n'
     '        _novel_data_lambda = getattr(args, "difix3d_lambda", 0.40)\n'
-    '        _difix_tau = getattr(args, "difix3d_tau", 400)\n'
+    '        _difix_tau = getattr(args, "difix3d_tau", 200)\n'
     '        _difix_schedule = compute_difix_schedule(\n'
     '            total_iters=opt.iterations,\n'
     '            views_per_cycle=_difix_views,\n'

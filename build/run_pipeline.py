@@ -109,10 +109,10 @@ TARGET_IMAGES = {
 }
 
 RECONSTRUCTION_CONTAINER = {
-    ("gaussian", "production"):       "onyx-milo",
+    ("gaussian", "production"):       "onyx-gsplat",   # default; --milo switches to onyx-milo
     ("gaussian", "proto"):            "onyx-gsplat",
     ("gaussian", "yono"):             "onyx-yonosplat",
-    ("gaussian", "dense"):            "onyx-milo",
+    ("gaussian", "dense"):            "onyx-gsplat",  # default; --milo switches to onyx-milo
     ("photogrammetry", "production"): "onyx-openmvs",
     ("photogrammetry", "proto"):      "onyx-openmvs",
 }
@@ -207,6 +207,9 @@ def get_required_containers(config=None):
         containers.append("onyx-ingest")
     recon = RECONSTRUCTION_CONTAINER.get((mode, quality))
     if recon:
+        # --milo flag overrides default gsplat for production/dense
+        if mode == "gaussian" and quality in ("production", "dense") and config.get("milo"):
+            recon = "onyx-milo"
         containers.append(recon)
     # dense mode also needs openmvs for the densify step
     if mode == "gaussian" and quality == "dense":
@@ -327,6 +330,7 @@ class PipelineState:
                 "depth_weight": config.get("depth_weight", 0.2),
                 "colmap_mapper": config.get("colmap_mapper", False),
                 "cameras": config.get("cameras"),
+                "milo": config.get("milo", False),
             },
             "started_at": datetime.now().isoformat(),
             "shared_steps": {
@@ -866,16 +870,21 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
     state.start_step("RECONSTRUCTION", container)
 
     if mode == "gaussian" and quality == "production":
-        _run_milo(config, state, output_dir, dry_run)
+        if config.get("milo"):
+            _run_milo(config, state, output_dir, dry_run)
+        else:
+            _run_gsplat(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "proto":
         _run_gsplat(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "yono":
         _run_yonosplat(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "dense":
-        # _run_gsplat(config, state, output_dir, dry_run,
-        #             init_pcd="/data/output/openmvs/scene_dense.ply")
-        _run_milo(config, state, output_dir, dry_run,
-                  init_pcd="/data/output/openmvs/scene_dense.ply")
+        if config.get("milo"):
+            _run_milo(config, state, output_dir, dry_run,
+                      init_pcd="/data/output/openmvs/scene_dense.ply")
+        else:
+            _run_gsplat(config, state, output_dir, dry_run,
+                        init_pcd="/data/output/openmvs/scene_dense.ply")
     elif mode == "photogrammetry":
         _run_openmvs(config, state, output_dir, dry_run)
 
@@ -935,7 +944,7 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
 def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
     quality = config.get("quality", "proto")
     scene = config.get("scene", "indoor")
-    iterations = "30000" if quality == "dense" else "7000"
+    iterations = "7000" if quality == "proto" else "30000"
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
         *uid_gid_flags(),
@@ -1655,6 +1664,9 @@ def parse_args():
     parser.add_argument("--colmap-mapper", action="store_true",
                         help="Use COLMAP incremental mapper instead of InstantSfM "
                              "(better for cubemap/multi-camera data)")
+    parser.add_argument("--milo", action="store_true",
+                        help="Use MILo (mesh-in-the-loop) for gaussian/production "
+                             "instead of the default gsplat. Enables mesh extraction.")
     return parser.parse_args()
 
 
@@ -1714,10 +1726,14 @@ def main():
         if args.interval:
             config["interval_override"] = args.interval
 
-        # Allow enabling difix3d on resume
+        # Allow enabling difix3d / milo on resume
         if args.difix3d and not config.get("difix3d"):
             config["difix3d"] = True
             state.data["base_config"]["difix3d"] = True
+            state.save()
+        if args.milo and not config.get("milo"):
+            config["milo"] = True
+            state.data["base_config"]["milo"] = True
             state.save()
 
         if args.from_step:
@@ -1801,6 +1817,7 @@ def main():
             "depth_weight": args.depth_weight,
             "colmap_mapper": args.colmap_mapper,
             "cameras": args.cameras,
+            "milo": args.milo,
         }
         if args.interval:
             config["interval_override"] = args.interval

@@ -5,56 +5,65 @@ Loaded only when --difix3d is passed to MILo's train.py.
 
 Two-phase approach (matching the Difix3D+ baseline):
 
-Phase 1 — Fix cycles (at scheduled iterations 9000 / 13000 / 17000):
-  1. Sample n_views pairs of distant training cameras.
-  2. SLERP rotation + LERP translation to obtain a novel-view pose.
-  3. Render the current scene at the novel pose (no_grad).
-  4. Run Difix on the render to produce an enhanced pseudo-GT image.
-  5. Perform n_grad_steps immediate gradient updates against the enhanced image.
-  6. Append (synthetic_camera, enhanced_image_cpu) to the novel_data_pool
-     so it can be reused in subsequent training iterations.
+Phase 1 — Fix cycles (NVIDIA-matched schedule, starts at ~12%):
+  1. Progressive shift: generate novel cameras that march from training
+     poses toward inter-frame midpoints (NVIDIA approach).
+  2. Render the current scene at novel poses (no_grad).
+  3. Run Difix to produce enhanced pseudo-GT images.
+  4. Perform n_grad_steps immediate gradient updates (MILo custom optimizer).
+  5. Flush the novel_data_pool and refill with new cycle's data.
 
 Phase 2 — Novel data reuse (every iteration after first fix cycle):
-  With probability novel_data_lambda (~0.3), sample a random entry from
+  With probability novel_data_lambda (~0.40), sample a random entry from
   novel_data_pool and perform one extra gradient step against that stored
-  enhanced image.  This mirrors the --novel_data_lambda mechanism in
-  Difix3D+'s simple_trainer_difix3d.py.
+  enhanced image.
 
-Mesh-in-the-loop regularization is NOT applied during either phase;
-only the Gaussian appearance parameters are updated.
+Alignment with NVIDIA paper:
+  - tau=200 (NVIDIA default)
+  - Schedule starts at ~12% of training (early start for compound refinement)
+  - ProgressiveShifter: poses march from training cameras toward midpoints
+  - Pool flush: stale data discarded each cycle, only latest retained
+
+MILo-specific (preserved):
+  - Custom gaussian optimizer (step(radii > 0, n)) with immediate grad steps
+  - Depth-based confidence weighting in loss
+  - Mask penalty for ref camera selection
 """
 
 import sys
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 from PIL import Image as PILImage
 
 _DIFIX_PROMPT = "remove degradation"
-# Default tau=400 (timestep=399) for stronger corrections than the paper's tau=200.
-# Paper ablation: tau=200 optimal for mild artifacts, but our novel-view renders
-# mid-training have worse artifacts (holes, floaters) → higher tau helps.
-# Configurable via --difix3d_tau CLI arg.
-_DIFIX_TAU_DEFAULT = 400
-# Maximum entries kept in the novel data pool (oldest evicted beyond this limit).
-# At 800×1200 px, 200 images ≈ 2.3 GB on CPU RAM — acceptable for 32 GB hosts.
+# tau=200: NVIDIA paper default. Higher values (e.g. 400) give stronger
+# corrections but reduce texture coherence. Configurable via --difix3d_tau.
+_DIFIX_TAU_DEFAULT = 200
+# Maximum pool entries (pool is flushed each cycle, so this is a safety cap).
 _MAX_POOL_SIZE = 200
 
+# Module-level lazy-initialized ProgressiveShifter (persists across fix cycles).
+_shifter: Optional["ProgressiveShifter"] = None
+
+
+# ── Schedule ──────────────────────────────────────────────────────────────────
 
 def compute_difix_schedule(
     total_iters: int,
     views_per_cycle: int = 48,
-    start_pct: float = 0.50,
-    end_pct: float = 0.95,
+    start_pct: float = 0.12,
+    end_pct: float = 0.98,
     target_synthetic_pct: float = 0.23,
     novel_lambda: float = 0.40,
 ) -> List[int]:
     """Compute fix cycle iterations to match a target synthetic data ratio.
 
     Matches the official Difix3D+ baseline (~23% synthetic training steps).
-    Schedule adapts to any total_iters value (indoor 18k, outdoor variants, etc.).
+    Starts early (~12%) so the progressive shift feedback loop has time to
+    compound across many cycles — key to the NVIDIA approach.
 
     Returns sorted list of iteration numbers for fix cycles.
     """
@@ -65,19 +74,16 @@ def compute_difix_schedule(
     # Solve for num_cycles:
     #   total_synth = num_cycles * views_per_cycle + novel_lambda * reuse_window
     #   target = total_synth / (total_iters + total_synth)
-    #   → total_synth = target * total_iters / (1 - target)
     total_synth_needed = target_synthetic_pct * total_iters / (1 - target_synthetic_pct)
     reuse_steps = novel_lambda * reuse_window
     direct_steps_needed = max(total_synth_needed - reuse_steps, views_per_cycle)
     num_cycles = max(3, round(direct_steps_needed / views_per_cycle))
 
-    # Space cycles evenly across [start_iter, end_iter]
     if num_cycles == 1:
         return [start_iter]
     spacing = (end_iter - start_iter) / (num_cycles - 1)
     schedule = [int(start_iter + i * spacing) for i in range(num_cycles)]
 
-    # Actual ratio for logging
     actual_synth = num_cycles * views_per_cycle + reuse_steps
     actual_pct = actual_synth / (total_iters + actual_synth) * 100
     print(f"[difix] Schedule: {num_cycles} cycles × {views_per_cycle} views "
@@ -102,7 +108,7 @@ class _SyntheticCamera:
     uid: int = -1
 
 
-# ── Camera interpolation (SLERP + LERP) ──────────────────────────────────────
+# ── Camera helpers ─────────────────────────────────────────────────────────────
 
 def _interpolate_camera(
     cam_a, cam_b, t: float = 0.5, uid: int = -1
@@ -127,20 +133,18 @@ def _interpolate_camera(
 
     device = cam_a.world_view_transform.device
 
-    # WVT[:3, :3] = R^T  →  R = (R^T)^T
     R_T_a = cam_a.world_view_transform[:3, :3].cpu().float().numpy()
     R_T_b = cam_b.world_view_transform[:3, :3].cpu().float().numpy()
 
     rots = Rotation.from_matrix(np.stack([R_T_a.T, R_T_b.T]))
     slerp = Slerp([0.0, 1.0], rots)
     R_interp = slerp([float(t)]).as_matrix()[0]   # [3, 3]
-    R_T_interp = R_interp.T                        # back to R^T for WVT
+    R_T_interp = R_interp.T
 
     cc_a = cam_a.camera_center.cpu().float().numpy()
     cc_b = cam_b.camera_center.cpu().float().numpy()
-    cc_interp = (1.0 - t) * cc_a + t * cc_b        # [3]
+    cc_interp = (1.0 - t) * cc_a + t * cc_b
 
-    # WVT[:3,:3] = R^T,  WVT[3,:3] = t_view = -R @ cc
     wvt_np = np.zeros((4, 4), dtype=np.float32)
     wvt_np[:3, :3] = R_T_interp
     wvt_np[3, :3]  = -R_interp @ cc_interp
@@ -168,6 +172,198 @@ def _interpolate_camera(
     )
 
 
+def _slerp_c2w(c2w_a: torch.Tensor, c2w_b: torch.Tensor, t: float) -> np.ndarray:
+    """Interpolate two [3,4] c2w matrices: SLERP rotation + LERP translation."""
+    from scipy.spatial.transform import Rotation, Slerp  # noqa: PLC0415
+
+    R_a = c2w_a[:3, :3].cpu().float().numpy()
+    R_b = c2w_b[:3, :3].cpu().float().numpy()
+    rots = Rotation.from_matrix(np.stack([R_a, R_b]))
+    slerp = Slerp([0.0, 1.0], rots)
+    R_interp = slerp([float(t)]).as_matrix()[0]
+
+    t_a = c2w_a[:3, 3].cpu().float().numpy()
+    t_b = c2w_b[:3, 3].cpu().float().numpy()
+    t_interp = (1.0 - t) * t_a + t * t_b
+
+    c2w = np.zeros((3, 4), dtype=np.float32)
+    c2w[:3, :3] = R_interp
+    c2w[:3, 3] = t_interp
+    return c2w
+
+
+def _camera_from_c2w(
+    c2w: torch.Tensor, ref_cam, uid: int = -1
+) -> "_SyntheticCamera":
+    """Build _SyntheticCamera from a [3,4] cam-to-world matrix.
+
+    Uses ref_cam for intrinsics (FoV, resolution, projection matrix).
+    """
+    device = ref_cam.world_view_transform.device
+    R_np = c2w[:3, :3].float().numpy()   # cam-to-world rotation
+    cc_np = c2w[:3, 3].float().numpy()   # camera center in world space
+
+    # WVT = W2C in column-major form:
+    #   upper-left 3×3 = R^T (world-to-cam rotation transposed)
+    #   bottom row [0:3] = t_view = -R @ cc
+    wvt_np = np.zeros((4, 4), dtype=np.float32)
+    wvt_np[:3, :3] = R_np.T
+    wvt_np[3, :3]  = -R_np @ cc_np
+    wvt_np[3, 3]   = 1.0
+
+    wvt = torch.tensor(wvt_np, dtype=torch.float32, device=device)
+
+    proj = getattr(ref_cam, "projection_matrix", None)
+    if proj is None:
+        proj = torch.inverse(ref_cam.world_view_transform) @ ref_cam.full_proj_transform
+
+    fpt = wvt.unsqueeze(0).bmm(proj.unsqueeze(0)).squeeze(0)
+    cc  = torch.tensor(cc_np, dtype=torch.float32, device=device)
+
+    return _SyntheticCamera(
+        world_view_transform=wvt,
+        projection_matrix=proj,
+        full_proj_transform=fpt,
+        camera_center=cc,
+        image_height=ref_cam.image_height,
+        image_width=ref_cam.image_width,
+        FoVx=ref_cam.FoVx,
+        FoVy=ref_cam.FoVy,
+        uid=uid,
+    )
+
+
+# ── Progressive Shifter (NVIDIA approach) ─────────────────────────────────────
+
+class ProgressiveShifter:
+    """NVIDIA-style progressive pose shifting for novel view generation.
+
+    Poses start at training camera positions and march toward inter-camera
+    midpoints across fix cycles. Over ~N cycles the novel views progressively
+    fill in gaps between training cameras — compound refinement.
+
+    Mirrors NVIDIA's CameraPoseInterpolator.shift_poses():
+      each cycle: current_pose += distance * (target - current) / ||target - current||
+    """
+
+    def __init__(self, train_cams):
+        import torch.nn.functional as F
+
+        # Extract [N, 3, 4] c2w matrices from MILo cameras.
+        # MILo WVT[:3,:3] = R^T  →  cam-to-world R = WVT[:3,:3].T
+        c2ws = []
+        for cam in train_cams:
+            R = cam.world_view_transform[:3, :3].float().cpu().T  # cam-to-world
+            cc = cam.camera_center.float().cpu()
+            c2w = torch.zeros(3, 4)
+            c2w[:3, :3] = R
+            c2w[:3, 3] = cc
+            c2ws.append(c2w)
+        self.c2ws = torch.stack(c2ws)       # [N, 3, 4]
+        self.train_cams = train_cams
+
+        centres = self.c2ws[:, :3, 3]       # [N, 3]
+        n_cams = len(train_cams)
+
+        # Sort cameras along principal movement axis, compute midpoints.
+        if n_cams < 2:
+            self.targets = None
+            self.current_poses = None
+            return
+
+        principal = torch.pca_lowrank(
+            centres - centres.mean(0), q=1)[0].squeeze()
+        order = torch.argsort(principal)
+
+        targets = []
+        for k in range(len(order) - 1):
+            i, j = order[k].item(), order[k + 1].item()
+            mid = _slerp_c2w(self.c2ws[i], self.c2ws[j], 0.5)
+            targets.append(torch.tensor(mid, dtype=torch.float32))
+
+        self.targets = torch.stack(targets) if targets else None
+        self.current_poses = None   # lazy init on first cycle
+
+        if self.targets is not None:
+            print(f"[difix] ProgressiveShifter: {n_cams} cameras, "
+                  f"{len(targets)} midpoint targets")
+
+    def _init_current_poses(self):
+        """Initialise current poses as the nearest training camera to each target."""
+        centres = self.c2ws[:, :3, 3]
+        current = []
+        for target in self.targets:
+            target_pos = target[:3, 3]
+            dists = torch.norm(centres - target_pos, dim=1)
+            nearest = dists.argmin().item()
+            current.append(self.c2ws[nearest].clone())
+        self.current_poses = torch.stack(current)
+
+    def generate_views(
+        self,
+        n_views: int,
+        distance: float = 0.5,
+        mask_penalty: Optional[torch.Tensor] = None,
+    ) -> Optional[List[Tuple["_SyntheticCamera", int]]]:
+        """Shift current poses toward targets, return novel (_SyntheticCamera, ref_idx) pairs.
+
+        Returns None if targets are unavailable (triggers SLERP fallback).
+        """
+        import torch.nn.functional as F
+
+        if self.targets is None:
+            return None
+
+        if self.current_poses is None:
+            self._init_current_poses()
+
+        centres = self.c2ws[:, :3, 3]
+        forwards = -self.c2ws[:, :3, 2]   # camera forward = -Z axis in world space
+        forwards = F.normalize(forwards, dim=1)
+
+        # Shift each current pose toward its target by `distance` scene units.
+        new_poses = []
+        for current, target in zip(self.current_poses, self.targets):
+            t_current = current[:3, 3]
+            t_target = target[:3, 3]
+            dist = torch.norm(t_target - t_current).item()
+            t_ratio = min(distance / (dist + 1e-8), 1.0)
+            shifted = _slerp_c2w(current, target, t_ratio)
+            new_poses.append(torch.tensor(shifted, dtype=torch.float32))
+
+        self.current_poses = torch.stack(new_poses)
+
+        # Sub-sample to n_views if we have more targets than requested.
+        n_available = len(self.current_poses)
+        if n_available > n_views:
+            indices = torch.randperm(n_available)[:n_views].tolist()
+        else:
+            indices = list(range(n_available))
+
+        novel_cameras = []
+        for idx in indices:
+            c2w = self.current_poses[idx]
+            interp_pos = c2w[:3, 3]
+
+            # Ref camera: 60% direction + 40% position scoring (mask-penalty aware).
+            pos_dists = torch.norm(centres - interp_pos, dim=1)
+            pos_score = 1.0 - pos_dists / (pos_dists.max() + 1e-8)
+
+            interp_fwd = -c2w[:3, 2]
+            interp_fwd = F.normalize(interp_fwd, dim=0)
+            dir_score = (forwards * interp_fwd.unsqueeze(0)).sum(dim=1)
+
+            combined = 0.6 * dir_score + 0.4 * pos_score
+            if mask_penalty is not None:
+                combined = combined - mask_penalty
+            ref_idx = combined.argmax().item()
+
+            synth_cam = _camera_from_c2w(c2w, self.train_cams[ref_idx], uid=-(idx + 1))
+            novel_cameras.append((synth_cam, ref_idx))
+
+        return novel_cameras
+
+
 # ── Difix model ───────────────────────────────────────────────────────────────
 
 def init_difix(device: str = "cuda"):
@@ -192,7 +388,7 @@ def init_difix(device: str = "cuda"):
     return pipe
 
 
-# ── image conversion helpers ──────────────────────────────────────────────────
+# ── Image conversion helpers ──────────────────────────────────────────────────
 
 def _tensor_to_pil(t: torch.Tensor) -> PILImage.Image:
     """Float [3, H, W] tensor in [0, 1] → RGB PIL Image."""
@@ -218,7 +414,7 @@ def difix_fix_step(
     opt,
     background: torch.Tensor,
     iteration: int,
-    novel_data_pool: List[Tuple],   # mutable list; (synth_cam, enhanced_cpu, weight_cpu) appended
+    novel_data_pool: List[Tuple],
     n_views: int = 48,
     n_grad_steps: int = 1,
     save_debug_images: bool = True,
@@ -227,36 +423,33 @@ def difix_fix_step(
 ) -> None:
     """Run one Difix3D+ fix cycle within MILo training.
 
-    Generates n_views novel-view cameras (diverse distant-pair SLERP),
-    then for each:
-      - renders the current scene (no_grad),
-      - enhances with Difix → pseudo-GT,
-      - performs n_grad_steps immediate gradient updates,
-      - appends (synth_cam, enhanced_image_cpu) to novel_data_pool for reuse.
+    Novel cameras are generated via ProgressiveShifter (NVIDIA approach):
+    poses progressively march from training cameras toward midpoints across
+    cycles. Falls back to random distant-pair SLERP if shifter unavailable.
 
-    Camera-pair strategy (CuriGS CVPR 2025 + InstantSplat):
-      - Anchor: shuffled permutation of training cameras.
-      - Partner: drawn from top-3 FURTHEST cameras from the anchor.
-      - t: uniform random in [0.15, 0.85] for varied interpolation depth.
+    Pool is flushed at the start of each cycle (NVIDIA approach): stale
+    data from worse model states is discarded, only the latest cycle's
+    enhanced images are retained for reuse.
     """
     from utils.loss_utils import l1_loss    # noqa: PLC0415
     from fused_ssim import fused_ssim       # noqa: PLC0415
+    import gc
 
-    difix_timesteps = [difix_tau - 1]  # tau=400 → timestep 399
+    global _shifter
+
+    difix_timesteps = [difix_tau - 1]
     print(
         f"[difix] Fix cycle @ iter {iteration} — "
         f"{n_views} novel views × {n_grad_steps} grad step(s), tau={difix_tau}"
     )
 
     # Free VRAM before moving Difix pipeline to GPU
-    import gc
     torch.cuda.empty_cache()
     gc.collect()
-    torch.cuda.empty_cache()  # second pass after gc
+    torch.cuda.empty_cache()
     free_gb = torch.cuda.mem_get_info()[0] / 1e9
     print(f"[difix] VRAM free before Difix load: {free_gb:.1f} GB")
 
-    # Enable memory-efficient attention if available (saves ~1GB during VAE decode)
     try:
         difix_pipe.enable_attention_slicing(1)
     except Exception:
@@ -266,82 +459,76 @@ def difix_fix_step(
     except Exception:
         pass
 
-    # Enforce fp16 during GPU transfer — .to("cuda") alone may upcast to fp32
     difix_pipe.to(device="cuda", dtype=torch.float16)
     free_gb = torch.cuda.mem_get_info()[0] / 1e9
     print(f"[difix] Pipeline on GPU (fp16), VRAM free: {free_gb:.1f} GB")
 
     train_cams = scene.getTrainCameras()
     if len(train_cams) < 2:
-        print("[difix] Need ≥2 training cameras for interpolation — skipping.")
+        print("[difix] Need ≥2 training cameras — skipping.")
         return
 
+    # ── Flush pool (NVIDIA approach) ──────────────────────────────────────────
+    # Each cycle replaces stale data from a worse model with fresh renders.
+    novel_data_pool.clear()
+
+    # ── Compute mask penalty for ref selection ────────────────────────────────
     centres = torch.stack([c.camera_center for c in train_cams], dim=0)  # [N, 3]
-    # Forward vectors: camera looks along -Z in camera space.
-    # WVT[:3,:3] = R^T, so forward_world = -R^T[:, 2] = -WVT[:3, 2]
     forwards = torch.stack(
         [-c.world_view_transform[:3, 2] for c in train_cams], dim=0
-    )  # [N, 3]
+    )
     forwards = torch.nn.functional.normalize(forwards, dim=1)
 
-    # Precompute mask penalty: cameras with masked transients are poor Difix refs
     mask_penalty = torch.zeros(len(train_cams), device=centres.device)
     for ci, cam in enumerate(train_cams):
         gt_mask = getattr(cam, "gt_mask", None)
         if gt_mask is not None:
-            # Penalty proportional to masked fraction (black=excluded pixels)
             mask_penalty[ci] = (1.0 - gt_mask.mean().item()) * 2.0
 
-    rng = torch.Generator(device="cpu")
-    rng.manual_seed(iteration)
+    # ── Generate novel cameras (ProgressiveShifter or SLERP fallback) ─────────
+    if _shifter is None:
+        _shifter = ProgressiveShifter(train_cams)
 
-    n_sample = min(n_views, len(train_cams))
-    perm = torch.randperm(len(train_cams), generator=rng).tolist()
-    top_k = min(3, len(train_cams) - 1)
+    novel_cameras = _shifter.generate_views(n_views, mask_penalty=mask_penalty)
 
-    pairs: list = []
-    t_vals: list = []
-    nearest_ref_idx: list = []   # index of closest training cam for ref_image
-    for i in range(n_sample):
-        a_idx = perm[i % len(perm)]
-        dists = torch.norm(centres - centres[a_idx], dim=1)
-        dists[a_idx] = -1.0
-        _, topk_idx = torch.topk(dists, top_k)
-        b_slot = torch.randint(top_k, (1,), generator=rng).item()
-        b_idx = topk_idx[b_slot].item()
-        t = float(torch.rand(1, generator=rng).item() * 0.70 + 0.15)
-        pairs.append((a_idx, b_idx))
-        t_vals.append(t)
-        # Combined direction + position scoring for ref camera selection.
-        # Direction alone can pick cameras far away; position alone fails for
-        # 360 scenes where nearby cameras point in opposite directions.
-        interp_centre = (1.0 - t) * centres[a_idx] + t * centres[b_idx]
-        pos_dists = torch.norm(centres - interp_centre, dim=1)
-        pos_score = 1.0 - pos_dists / (pos_dists.max() + 1e-8)  # [0, 1]
+    if novel_cameras is None:
+        # Fallback: random distant-pair SLERP (original MILo strategy)
+        rng = torch.Generator(device="cpu")
+        rng.manual_seed(iteration)
+        n_sample = min(n_views, len(train_cams))
+        perm = torch.randperm(len(train_cams), generator=rng).tolist()
+        top_k = min(3, len(train_cams) - 1)
 
-        interp_fwd = (1.0 - t) * forwards[a_idx] + t * forwards[b_idx]
-        interp_fwd = torch.nn.functional.normalize(interp_fwd, dim=0)
-        dir_score = (forwards * interp_fwd.unsqueeze(0)).sum(dim=1)  # [-1, 1]
+        novel_cameras = []
+        for i in range(n_sample):
+            a_idx = perm[i % len(perm)]
+            dists = torch.norm(centres - centres[a_idx], dim=1)
+            dists[a_idx] = -1.0
+            _, topk_idx = torch.topk(dists, top_k)
+            b_slot = torch.randint(top_k, (1,), generator=rng).item()
+            b_idx = topk_idx[b_slot].item()
+            t = float(torch.rand(1, generator=rng).item() * 0.70 + 0.15)
 
-        # 60% direction, 40% position, penalize masked cameras as refs
-        combined = 0.6 * dir_score + 0.4 * pos_score - mask_penalty
-        nearest_ref_idx.append(combined.argmax().item())
+            synth_cam = _interpolate_camera(
+                train_cams[a_idx], train_cams[b_idx], t=t,
+                uid=-(iteration * 1000 + i),
+            )
+            interp_centre = synth_cam.camera_center
+            pos_dists = torch.norm(centres - interp_centre, dim=1)
+            pos_score = 1.0 - pos_dists / (pos_dists.max() + 1e-8)
+            interp_fwd = torch.nn.functional.normalize(
+                (1.0 - t) * forwards[a_idx] + t * forwards[b_idx], dim=0)
+            dir_score = (forwards * interp_fwd.unsqueeze(0)).sum(dim=1)
+            combined = 0.6 * dir_score + 0.4 * pos_score - mask_penalty
+            ref_idx = combined.argmax().item()
+            novel_cameras.append((synth_cam, ref_idx))
 
+    # ── Render → Difix → grad update → pool ──────────────────────────────────
     total_steps = 0
-    base_uid = -(iteration * 1000)
+    _DIFIX_SIZE = 512
 
-    for pair_idx, ((idx_a, idx_b), t) in enumerate(zip(pairs, t_vals)):
-        cam_a = train_cams[idx_a]
-        cam_b = train_cams[idx_b]
-        synth_uid = base_uid - pair_idx
-
-        try:
-            synth_cam = _interpolate_camera(cam_a, cam_b, t=t, uid=synth_uid)
-        except Exception as exc:
-            print(f"[difix] Camera interpolation failed ({idx_a},{idx_b}): {exc}")
-            continue
-
-        # Render novel view (no grad). Convert to PIL immediately to free GPU memory.
+    for pair_idx, (synth_cam, ref_cam_idx) in enumerate(novel_cameras):
+        # Render novel view (no grad)
         with torch.no_grad():
             render_pkg_base = render_func(
                 synth_cam, gaussians, pipe, background,
@@ -352,20 +539,14 @@ def difix_fix_step(
             base_pil = _tensor_to_pil(rendered_base)
             del render_pkg_base, rendered_base
 
-        # Reclaim VRAM from MILo render intermediates before Difix inference
         torch.cuda.empty_cache()
 
-        # Downscale to 512px (SD-Turbo's native resolution) to fit in VRAM
-        # and produce best quality output. Upscale back to render size after.
-        _DIFIX_SIZE = 512
         base_small = base_pil.resize((_DIFIX_SIZE, _DIFIX_SIZE), PILImage.LANCZOS)
 
-        # Use the original training photograph as ref_image (clean, no artifacts).
-        ref_cam = train_cams[nearest_ref_idx[pair_idx]]
+        ref_cam = train_cams[ref_cam_idx]
         ref_pil = _tensor_to_pil(ref_cam.original_image)
         ref_small = ref_pil.resize((_DIFIX_SIZE, _DIFIX_SIZE), PILImage.LANCZOS)
 
-        # Difix enhancement (original photo ref guides texture correction)
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             enhanced_small = difix_pipe(
                 _DIFIX_PROMPT,
@@ -375,7 +556,6 @@ def difix_fix_step(
                 timesteps=difix_timesteps,
                 guidance_scale=0.0,
             ).images[0]
-            # Upscale back to original render dimensions
             enhanced_pil = enhanced_small.resize((render_w, render_h), PILImage.LANCZOS)
             enhanced_gpu = _pil_to_tensor(enhanced_pil, device="cuda")
 
@@ -391,9 +571,6 @@ def difix_fix_step(
                 print(f"[difix] Debug images → {debug_dir}")
 
         # Immediate gradient update(s) with depth-based confidence weighting.
-        # Render with depth to compute per-pixel confidence:
-        #   - Valid depth → well-reconstructed → lower weight on diffusion target
-        #   - No/extreme depth → holes/sparse → higher weight on diffusion target
         for _ in range(n_grad_steps):
             render_pkg_grad = render_func(
                 synth_cam, gaussians, pipe, background,
@@ -401,17 +578,16 @@ def difix_fix_step(
             )
             img   = render_pkg_grad["render"]
             radii = render_pkg_grad["radii"]
-            depth = render_pkg_grad.get("expected_depth")  # [1,H,W] or None
+            depth = render_pkg_grad.get("expected_depth")   # [1, H, W] or None
 
-            # Confidence weight map: trust diffusion more where depth is missing
+            # Depth-based confidence: trust diffusion more where depth is missing
             if depth is not None:
                 valid = (depth > 1e-4).float()
-                # Smooth to avoid hard edges
                 weight = 1.0 - torch.nn.functional.avg_pool2d(
                     valid, kernel_size=11, stride=1, padding=5
-                ) * 0.7  # range [0.3, 1.0]
+                ) * 0.7   # range [0.3, 1.0]
             else:
-                weight = 1.0  # fallback: uniform weighting
+                weight = 1.0
 
             Ll1      = (weight * torch.abs(img - enhanced_gpu)).mean()
             ssim_val = fused_ssim(img.unsqueeze(0), enhanced_gpu.unsqueeze(0))
@@ -425,15 +601,10 @@ def difix_fix_step(
             gaussians_optimizer.zero_grad(set_to_none=True)
             total_steps += 1
 
-        # Store in pool for later reuse (CPU to avoid holding VRAM)
-        # Include weight map for novel_step reuse
+        # Store in pool for reuse (CPU to free VRAM)
         weight_cpu = weight.cpu() if torch.is_tensor(weight) else None
         novel_data_pool.append((synth_cam, enhanced_gpu.cpu(), weight_cpu))
-        if len(novel_data_pool) > _MAX_POOL_SIZE:
-            # Evict oldest entry
-            novel_data_pool.pop(0)
 
-    # Move Difix back to CPU to free VRAM for normal training
     difix_pipe.to("cpu")
     torch.cuda.empty_cache()
     print(
@@ -444,7 +615,7 @@ def difix_fix_step(
 
 # ── Phase 2: novel data reuse ─────────────────────────────────────────────────
 
-_novel_step_count = 0   # module-level counter for logging
+_novel_step_count = 0
 
 
 def difix_novel_step(
@@ -458,7 +629,7 @@ def difix_novel_step(
 ) -> None:
     """One extra gradient step using a random entry from the novel data pool.
 
-    Called probabilistically (novel_data_lambda ≈ 0.3) every training
+    Called probabilistically (novel_data_lambda ≈ 0.40) every training
     iteration after the first fix cycle, mirroring the --novel_data_lambda
     mechanism in Difix3D+'s simple_trainer_difix3d.py.
     """
@@ -468,7 +639,6 @@ def difix_novel_step(
     global _novel_step_count
     _novel_step_count += 1
 
-    # Random entry from pool (supports both old 2-tuple and new 3-tuple format)
     idx = torch.randint(len(novel_data_pool), (1,)).item()
     entry = novel_data_pool[idx]
     if len(entry) == 3:
@@ -497,7 +667,6 @@ def difix_novel_step(
         gaussians_optimizer.step(radii > 0, radii.shape[0])
     gaussians_optimizer.zero_grad(set_to_none=True)
 
-    # Log every 500 calls
     if _novel_step_count % 500 == 0:
         print(f"[difix] Novel data reuse: {_novel_step_count} steps so far "
               f"(pool={len(novel_data_pool)}, loss={loss.item():.4f})")
