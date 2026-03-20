@@ -35,14 +35,24 @@ def setup_workspace(data_path):
         shutil.rmtree(ws)
     ws.mkdir(parents=True)
 
+    # Prefer undistorted/ output from SfM step (SIMPLE_RADIAL → PINHOLE).
+    # Falls back to sparse/0/ for 360 pipelines that use PINHOLE directly.
+    undistorted = Path(data_path) / "undistorted"
+    if undistorted.exists():
+        sparse_src = undistorted / "sparse"
+        image_src = undistorted / "images"
+        print("[OpenMVS] Using undistorted cameras from undistorted/")
+    else:
+        sparse_src = Path(data_path) / "sparse" / "0"
+        image_src = Path(data_path) / "images"
+
     # InterfaceCOLMAP expects sparse/cameras.bin at root level (not sparse/0/)
-    sparse_src = Path(data_path) / "sparse" / "0"
     sparse_dst = ws / "sparse"
     sparse_dst.mkdir()
     for f in sparse_src.iterdir():
         shutil.copy2(str(f), str(sparse_dst / f.name))
 
-    return ws
+    return ws, image_src
 
 
 def main():
@@ -83,7 +93,7 @@ def main():
     print("=" * 60)
 
     # Setup ephemeral workspace
-    ws = setup_workspace(data_path)
+    ws, image_src = setup_workspace(data_path)
     TOTAL_STEPS = TOTAL_STEPS_DENSIFY if args.densify_only else TOTAL_STEPS_FULL
 
     # ── Step 1: InterfaceCOLMAP ───────────────────────────────
@@ -91,7 +101,7 @@ def main():
     run_with_progress(
         ["InterfaceCOLMAP",
          "--input-file", str(ws),
-         "--image-folder", str(data_path / "images"),
+         "--image-folder", str(image_src),
          "--output-file", str(ws / "scene.mvs")],
         stage="interface_colmap",
         step=1, total_steps=TOTAL_STEPS,

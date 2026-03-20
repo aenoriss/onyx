@@ -114,6 +114,26 @@ def main():
                 import shutil
                 shutil.rmtree(model_path)
 
+        # For normal video, undistort SIMPLE_RADIAL → PINHOLE so downstream
+        # tools (OpenMVS InterfaceCOLMAP) can read the cameras directly.
+        # 360 uses hardcoded PINHOLE already — no undistortion needed.
+        if args.video_type == "normal":
+            undistorted_path = os.path.join(args.data_path, "undistorted")
+            if not os.path.exists(undistorted_path):
+                print("[SFM] Undistorting cameras (SIMPLE_RADIAL → PINHOLE)...")
+                run_with_progress(
+                    [
+                        "colmap", "image_undistorter",
+                        "--image_path", image_path,
+                        "--input_path", os.path.join(sparse_path, "0"),
+                        "--output_path", undistorted_path,
+                        "--output_type", "COLMAP",
+                    ],
+                    stage="undistort",
+                    step=2, total_steps=total_steps,
+                )
+                print(f"[SFM] Undistorted cameras written to undistorted/")
+
     else:
         # ── Stage 2: InstantSfM global mapper ──────────────────
         sfm_patterns = {
