@@ -29,6 +29,9 @@ def main():
                         help="Use InstantSfM global mapper instead of COLMAP")
     parser.add_argument("--video-type", choices=["normal", "360"], default="normal",
                         help="Video type: normal uses automatic intrinsics, 360 uses fixed 90° FOV")
+    parser.add_argument("--single-camera", action="store_true", default=False,
+                        help="Force single shared camera model (only for normal video from one physical camera). "
+                             "Off by default — COLMAP reads EXIF per image, supporting mixed cameras.")
     args = parser.parse_args()
 
     total_steps = 2
@@ -42,7 +45,8 @@ def main():
     }
 
     run_with_progress(
-        ["ins-feat", "--data_path", args.data_path, "--single_camera", "--video-type", args.video_type],
+        ["ins-feat", "--data_path", args.data_path, "--video-type", args.video_type]
+        + (["--single_camera"] if args.video_type == "normal" and args.single_camera else []),
         stage="feature_extraction",
         step=1, total_steps=total_steps,
         patterns=feat_patterns,

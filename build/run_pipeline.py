@@ -844,6 +844,9 @@ def step_sfm(config, state, output_dir, dry_run=False):
 
     cmd += ["--video-type", config.get("video", "normal")]
 
+    if config.get("single_camera", False):
+        cmd.append("--single-camera")
+
     run_docker(cmd, "SFM", state, output_dir, dry_run)
 
 
@@ -917,8 +920,10 @@ def _run_milo(config, state, output_dir, dry_run, init_pcd=None):
         dense_pts = "200000" if scene == "outdoor" else "100000"
         cmd.extend(["--init_pcd", init_pcd,
                     "--dense_init_pts", dense_pts])
-    if config.get("quality") == "dense":
-        cmd.append("--dense")
+        # Do NOT pass --dense when using a dense MVS init: --dense_gaussians triggers
+        # importance-pruning which kills 100K MVS points (each has tiny individual
+        # contribution → all score low). Intersection-based pruning (no --dense) is
+        # compatible with dense inits and preserves spatial coverage.
     if config.get("difix3d", False):
         cmd.append("--difix3d")
     if config.get("mask_classes"):
@@ -1582,6 +1587,10 @@ def parse_args():
                         help="Quality level (dense = OpenMVS densify → MILo init; yono = pose-free feed-forward, no SFM)")
     parser.add_argument("--video", choices=["normal", "360"],
                         help="Video type (required for video input, ignored for images)")
+    parser.add_argument("--single-camera", action="store_true", default=False,
+                        help="Force single shared camera model in COLMAP (only for footage "
+                             "from one physical camera). Default: off — EXIF per-image cameras, "
+                             "supports mixed cameras (e.g. 0.5x + 1x iPhone).")
 
     # Resume
     parser.add_argument("--resume", metavar="WORKDIR",
@@ -1776,6 +1785,7 @@ def main():
             "depth": args.depth,
             "depth_weight": args.depth_weight,
             "colmap_mapper": args.colmap_mapper,
+            "single_camera": args.single_camera,
         }
         if args.interval:
             config["interval_override"] = args.interval

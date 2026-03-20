@@ -43,10 +43,12 @@ def GenerateDatabase(image_path, database_path, feature_handler_name, config, si
                 '--ImageReader.camera_params', camera_params,
             ]
         else:
-            # Normal video: let COLMAP estimate intrinsics (SIMPLE_RADIAL handles lens distortion)
-            print(f"Normal video: using COLMAP automatic intrinsic estimation (SIMPLE_RADIAL)")
+            # Normal video: per-image cameras so mixed lenses (e.g. 0.5x + 1x iPhone) get
+            # separate intrinsics. BA naturally clusters focal lengths by camera type.
+            print(f"Normal video: per-image cameras with SIMPLE_RADIAL (supports mixed lenses)")
             feature_extractor_cmd += [
                 '--ImageReader.camera_model', 'SIMPLE_RADIAL',
+                '--ImageReader.single_camera_per_image', '1',
             ]
         exhaustive_matcher_cmd = [
             'colmap', 'exhaustive_matcher',
