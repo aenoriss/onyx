@@ -326,6 +326,7 @@ class PipelineState:
                 "depth": config.get("depth", False),
                 "depth_weight": config.get("depth_weight", 0.2),
                 "colmap_mapper": config.get("colmap_mapper", False),
+                "cameras": config.get("cameras"),
             },
             "started_at": datetime.now().isoformat(),
             "shared_steps": {
@@ -1025,7 +1026,6 @@ def step_masking(config, state, output_dir, dry_run=False):
         "--output", "/data/masks",
         "--classes", mask_classes,
     ]
-
     run_docker(cmd, "MASKING", state, output_dir, dry_run)
 
 

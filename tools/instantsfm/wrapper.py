@@ -141,6 +141,81 @@ def main():
                 )
                 print(f"[SFM] Undistorted cameras written to undistorted/")
 
+            # Promote undistorted data as main paths so all downstream tools
+            # (MILo, OpenMVS) get PINHOLE cameras and undistorted images:
+            #   sparse/0/  <- undistorted/sparse/  (PINHOLE replaces SIMPLE_RADIAL)
+            #   images/    <- flat dir of all undistorted images (MILo needs flat)
+            #   images.bin <- patched to strip subfolder prefixes (e.g. cam1/)
+            import shutil, struct, os as _os
+
+            # 1. Copy undistorted PINHOLE sparse → sparse/0/
+            sparse0 = _os.path.join(sparse_path, "0")
+            undist_sparse = _os.path.join(undistorted_path, "sparse")
+            for f in _os.listdir(undist_sparse):
+                shutil.copy2(_os.path.join(undist_sparse, f), _os.path.join(sparse0, f))
+            print("[SFM] sparse/0/ updated with PINHOLE cameras")
+
+            # 2. Flatten undistorted/images/**  →  images/ (prefixed by subfolder)
+            #    MILo uses os.path.basename(image_name) so needs flat layout.
+            #    Prefix each file with its camera subfolder name to avoid collisions
+            #    when multiple cameras share identical filenames (e.g. cam1 + cam2).
+            #    e.g. undistorted/images/cam1/frame.jpg → images/cam1_frame.jpg
+            undist_images = _os.path.join(undistorted_path, "images")
+            old_images = _os.path.join(args.data_path, "images")
+            if not _os.path.islink(old_images) and _os.path.isdir(old_images):
+                _os.rename(old_images, old_images + "_cam_orig")
+            elif _os.path.islink(old_images):
+                _os.unlink(old_images)
+            _os.makedirs(old_images, exist_ok=True)
+            # Build mapping: original relative path → flat destination name
+            path_to_flat = {}
+            for root, _dirs, files in _os.walk(undist_images):
+                rel_dir = _os.path.relpath(root, undist_images)
+                for fname in files:
+                    if rel_dir == ".":
+                        flat_name = fname
+                    else:
+                        # Use top-level subfolder as prefix: cam1/a/b/f.jpg → cam1_f.jpg
+                        top = rel_dir.split(_os.sep)[0]
+                        flat_name = top + "_" + fname
+                    src = _os.path.join(root, fname)
+                    dst = _os.path.join(old_images, flat_name)
+                    path_to_flat[_os.path.join(rel_dir, fname) if rel_dir != "." else fname] = flat_name
+                    shutil.copy2(src, dst)
+            flat_count = len(_os.listdir(old_images))
+            print(f"[SFM] images/ flattened — {flat_count} undistorted images (copied)")
+
+            # 3. Patch sparse/0/images.bin — rewrite names to match flat filenames
+            #    Original names are like "cam1/frame.jpg"; map to "cam1_frame.jpg"
+            images_bin = _os.path.join(sparse0, "images.bin")
+            with open(images_bin, "rb") as f:
+                data = f.read()
+            out = bytearray()
+            i = 0
+            n_imgs = struct.unpack_from("<Q", data, i)[0]; i += 8
+            out += struct.pack("<Q", n_imgs)
+            for _ in range(n_imgs):
+                header = data[i:i+64]; i += 64  # id + qvec + tvec + camera_id
+                out += header
+                name_start = i
+                while data[i:i+1] != b'\x00':
+                    i += 1
+                orig_name = data[name_start:i].decode()
+                i += 1  # skip null
+                # Map original "cam1/frame.jpg" → "cam1_frame.jpg"
+                parts = orig_name.replace("\\", "/").split("/")
+                if len(parts) > 1:
+                    flat_name = parts[0] + "_" + parts[-1]
+                else:
+                    flat_name = orig_name
+                out += flat_name.encode() + b'\x00'
+                n2d = struct.unpack_from("<Q", data, i)[0]; i += 8
+                out += struct.pack("<Q", n2d) + data[i:i + n2d * 24]
+                i += n2d * 24
+            with open(images_bin, "wb") as f:
+                f.write(out)
+            print(f"[SFM] images.bin patched — prefixed subfolder names ({n_imgs} images)")
+
     else:
         # ── Stage 2: InstantSfM global mapper ──────────────────
         sfm_patterns = {
