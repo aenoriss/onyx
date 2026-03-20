@@ -844,8 +844,8 @@ def step_sfm(config, state, output_dir, dry_run=False):
 
     cmd += ["--video-type", config.get("video", "normal")]
 
-    if config.get("single_camera", False):
-        cmd.append("--single-camera")
+    if config.get("cameras"):
+        cmd.extend(["--cameras"] + config["cameras"])
 
     run_docker(cmd, "SFM", state, output_dir, dry_run)
 
@@ -1587,10 +1587,10 @@ def parse_args():
                         help="Quality level (dense = OpenMVS densify → MILo init; yono = pose-free feed-forward, no SFM)")
     parser.add_argument("--video", choices=["normal", "360"],
                         help="Video type (required for video input, ignored for images)")
-    parser.add_argument("--single-camera", action="store_true", default=False,
-                        help="Force single shared camera model in COLMAP (only for footage "
-                             "from one physical camera). Default: off — EXIF per-image cameras, "
-                             "supports mixed cameras (e.g. 0.5x + 1x iPhone).")
+    parser.add_argument("--cameras", nargs='+', default=None, metavar="FOLDER",
+                        help="Subfolder names for multi-camera input (e.g. --cameras wide ultrawide). "
+                             "Images must be pre-sorted into images/<name>/ subfolders. "
+                             "Enables per-folder intrinsics. Default: single shared camera model (fast).")
 
     # Resume
     parser.add_argument("--resume", metavar="WORKDIR",
@@ -1752,12 +1752,27 @@ def main():
         img_files = []
         if is_images_input:
             IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
-            img_files = [f for f in input_path.iterdir()
-                         if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
-            if not img_files:
-                print(f"Error: No image files found in {input_path}")
-                sys.exit(1)
-            print(f"[IMAGES] Found {len(img_files)} images in {input_path}")
+            if args.cameras:
+                # Multi-camera: collect images from each subfolder
+                img_files = []
+                for cam in args.cameras:
+                    cam_dir = input_path / cam
+                    if not cam_dir.is_dir():
+                        print(f"Error: Camera folder not found: {cam_dir}")
+                        sys.exit(1)
+                    img_files += [f for f in cam_dir.iterdir()
+                                  if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
+                if not img_files:
+                    print(f"Error: No image files found in camera subfolders of {input_path}")
+                    sys.exit(1)
+                print(f"[IMAGES] Found {len(img_files)} images across {len(args.cameras)} cameras in {input_path}")
+            else:
+                img_files = [f for f in input_path.iterdir()
+                             if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
+                if not img_files:
+                    print(f"Error: No image files found in {input_path}")
+                    sys.exit(1)
+                print(f"[IMAGES] Found {len(img_files)} images in {input_path}")
             if args.video:
                 print("Warning: --video is ignored for images input")
             vtype = "normal"
@@ -1785,7 +1800,7 @@ def main():
             "depth": args.depth,
             "depth_weight": args.depth_weight,
             "colmap_mapper": args.colmap_mapper,
-            "single_camera": args.single_camera,
+            "cameras": args.cameras,
         }
         if args.interval:
             config["interval_override"] = args.interval
@@ -1793,15 +1808,27 @@ def main():
         state = PipelineState.create(output_dir, config)
 
         if is_images_input:
-            # Copy images into workdir
+            # Copy images into workdir (preserve subfolders for multi-camera)
             dest = output_dir / "images"
             dest.mkdir(parents=True, exist_ok=True)
             imported = 0
-            for f in sorted(img_files):
-                target = dest / f.name
-                if not target.exists():
-                    shutil.copy2(str(f), str(target))
-                    imported += 1
+            if args.cameras:
+                for cam in args.cameras:
+                    cam_src = input_path / cam
+                    cam_dst = dest / cam
+                    cam_dst.mkdir(parents=True, exist_ok=True)
+                    for f in sorted(cam_src.iterdir()):
+                        if f.is_file() and f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}:
+                            target = cam_dst / f.name
+                            if not target.exists():
+                                shutil.copy2(str(f), str(target))
+                                imported += 1
+            else:
+                for f in sorted(img_files):
+                    target = dest / f.name
+                    if not target.exists():
+                        shutil.copy2(str(f), str(target))
+                        imported += 1
             print(f"[IMAGES] Copied {imported} images → {dest}")
 
             # Write .video_type

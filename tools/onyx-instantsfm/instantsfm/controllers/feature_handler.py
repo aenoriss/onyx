@@ -15,7 +15,7 @@ def PairId2Ids(pair_id):
 def Ids2PairId(id1, id2):
     return (id1 * C_MAX_INT + id2 if id1 < id2 else id2 * C_MAX_INT + id1)
 
-def GenerateDatabase(image_path, database_path, feature_handler_name, config, single_camera=False, camera_per_folder=False, video_type='normal'):
+def GenerateDatabase(image_path, database_path, feature_handler_name, config, single_camera=False, camera_per_folder=False, video_type='normal', cameras=None):
     # colmap support from command line. ensure colmap is installed
     if feature_handler_name == 'colmap':
         import subprocess
@@ -25,8 +25,8 @@ def GenerateDatabase(image_path, database_path, feature_handler_name, config, si
             'colmap', 'feature_extractor',
             '--image_path', image_path,
             '--database_path', database_path,
-            '--ImageReader.single_camera', '1' if single_camera else '0',
-            '--ImageReader.single_camera_per_folder', '1' if (not single_camera and camera_per_folder) else '0',
+            '--ImageReader.single_camera', '1' if (single_camera and not cameras) else '0',
+            '--ImageReader.single_camera_per_folder', '1' if cameras else '0',
         ]
         if video_type == '360':
             # Cubemap faces always have 90° FOV — hardcode PINHOLE intrinsics
@@ -43,12 +43,12 @@ def GenerateDatabase(image_path, database_path, feature_handler_name, config, si
                 '--ImageReader.camera_params', camera_params,
             ]
         else:
-            # Normal video: per-image cameras so mixed lenses (e.g. 0.5x + 1x iPhone) get
-            # separate intrinsics. BA naturally clusters focal lengths by camera type.
-            print(f"Normal video: per-image cameras with SIMPLE_RADIAL (supports mixed lenses)")
+            if cameras:
+                print(f"Normal video: per-folder cameras {cameras} with SIMPLE_RADIAL")
+            else:
+                print(f"Normal video: single camera with SIMPLE_RADIAL")
             feature_extractor_cmd += [
                 '--ImageReader.camera_model', 'SIMPLE_RADIAL',
-                '--ImageReader.single_camera_per_image', '1',
             ]
         exhaustive_matcher_cmd = [
             'colmap', 'exhaustive_matcher',

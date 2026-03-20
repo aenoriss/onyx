@@ -30,8 +30,11 @@ def main():
     parser.add_argument("--video-type", choices=["normal", "360"], default="normal",
                         help="Video type: normal uses automatic intrinsics, 360 uses fixed 90° FOV")
     parser.add_argument("--single-camera", action="store_true", default=False,
-                        help="Force single shared camera model (only for normal video from one physical camera). "
-                             "Off by default — COLMAP reads EXIF per image, supporting mixed cameras.")
+                        help="Force single shared camera model (default for normal video from one physical camera).")
+    parser.add_argument("--cameras", nargs='+', default=None,
+                        help="Subfolder names for multi-camera input (e.g. --cameras wide ultrawide). "
+                             "Images must be pre-sorted into images/<name>/ subfolders. "
+                             "Enables per-folder intrinsics — much faster than per-image.")
     args = parser.parse_args()
 
     total_steps = 2
@@ -46,7 +49,7 @@ def main():
 
     run_with_progress(
         ["ins-feat", "--data_path", args.data_path, "--video-type", args.video_type]
-        + (["--single_camera"] if args.video_type == "normal" and args.single_camera else []),
+        + (["--cameras"] + args.cameras if args.cameras else ["--single_camera"]),
         stage="feature_extraction",
         step=1, total_steps=total_steps,
         patterns=feat_patterns,
