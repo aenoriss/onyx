@@ -35,6 +35,8 @@ def main():
                         help="Subfolder names for multi-camera input (e.g. --cameras wide ultrawide). "
                              "Images must be pre-sorted into images/<name>/ subfolders. "
                              "Enables per-folder intrinsics — much faster than per-image.")
+    parser.add_argument("--camera-params-file", default=None,
+                        help="Path to .camera_metadata.json with per-camera focal lengths")
     args = parser.parse_args()
 
     total_steps = 2
@@ -47,9 +49,13 @@ def main():
         ),
     }
 
+    feat_cmd = ["ins-feat", "--data_path", args.data_path, "--video-type", args.video_type]
+    feat_cmd += (["--cameras"] + args.cameras if args.cameras else ["--single_camera"])
+    if args.camera_params_file:
+        feat_cmd += ["--camera-params-file", args.camera_params_file]
+
     run_with_progress(
-        ["ins-feat", "--data_path", args.data_path, "--video-type", args.video_type]
-        + (["--cameras"] + args.cameras if args.cameras else ["--single_camera"]),
+        feat_cmd,
         stage="feature_extraction",
         step=1, total_steps=total_steps,
         patterns=feat_patterns,

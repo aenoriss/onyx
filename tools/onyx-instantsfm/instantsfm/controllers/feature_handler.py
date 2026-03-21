@@ -15,7 +15,60 @@ def PairId2Ids(pair_id):
 def Ids2PairId(id1, id2):
     return (id1 * C_MAX_INT + id2 if id1 < id2 else id2 * C_MAX_INT + id1)
 
-def GenerateDatabase(image_path, database_path, feature_handler_name, config, single_camera=False, camera_per_folder=False, video_type='normal', cameras=None):
+def _patch_database_focal_lengths(database_path, camera_params_file, cameras):
+    """Patch COLMAP database with per-camera focal length priors."""
+    import json, sqlite3, struct
+
+    with open(camera_params_file) as f:
+        meta = json.load(f)
+    cam_meta = meta.get("cameras", {})
+
+    conn = sqlite3.connect(database_path)
+    cursor = conn.cursor()
+
+    for i, cam_name in enumerate(sorted(cameras)):
+        if cam_name not in cam_meta:
+            continue
+        focal_px = cam_meta[cam_name].get("focal_px")
+        if focal_px is None:
+            continue
+        camera_id = i + 1
+
+        row = cursor.execute(
+            "SELECT model, width, height, params, prior_focal_length FROM cameras WHERE camera_id=?",
+            (camera_id,)
+        ).fetchone()
+        if not row:
+            continue
+        model, w, h, params_blob, prior = row
+        num_params = len(params_blob) // 8
+        params = list(struct.unpack(f'<{num_params}d', params_blob))
+
+        # Set fx (and fy if OPENCV which has separate fx,fy)
+        if model == 4:  # OPENCV: fx, fy, cx, cy, k1, k2, p1, p2
+            params[0] = focal_px  # fx
+            params[1] = focal_px  # fy
+        elif model == 2:  # SIMPLE_RADIAL: f, cx, cy, k1
+            params[0] = focal_px
+        elif model == 3:  # RADIAL: f, cx, cy, k1, k2
+            params[0] = focal_px
+        elif model == 1:  # PINHOLE: fx, fy, cx, cy
+            params[0] = focal_px
+            params[1] = focal_px
+
+        new_blob = struct.pack(f'<{num_params}d', *params)
+        # Also set prior_focal_length=1 so COLMAP trusts the initial value more
+        cursor.execute(
+            "UPDATE cameras SET params=?, prior_focal_length=1 WHERE camera_id=?",
+            (new_blob, camera_id)
+        )
+        print(f"[FOCAL PRIOR] Camera {camera_id} ({cam_name}): fx={focal_px:.1f}px (prior=True)")
+
+    conn.commit()
+    conn.close()
+
+
+def GenerateDatabase(image_path, database_path, feature_handler_name, config, single_camera=False, camera_per_folder=False, video_type='normal', cameras=None, camera_params_file=None):
     # colmap support from command line. ensure colmap is installed
     if feature_handler_name == 'colmap':
         import subprocess
@@ -44,12 +97,27 @@ def GenerateDatabase(image_path, database_path, feature_handler_name, config, si
             ]
         else:
             if cameras:
-                print(f"Normal video: per-folder cameras {cameras} with SIMPLE_RADIAL")
+                print(f"Normal video: per-folder cameras {cameras} with OPENCV (Brown-Conrady)")
             else:
-                print(f"Normal video: single camera with SIMPLE_RADIAL")
+                print(f"Normal video: single camera with OPENCV (Brown-Conrady)")
             feature_extractor_cmd += [
-                '--ImageReader.camera_model', 'SIMPLE_RADIAL',
+                '--ImageReader.camera_model', 'OPENCV',
             ]
+            # Apply focal length prior for single camera (no --cameras)
+            if camera_params_file and not cameras and os.path.exists(camera_params_file):
+                import json as _json
+                with open(camera_params_file) as _f:
+                    _meta = _json.load(_f)
+                _cam_meta = _meta.get("cameras", {})
+                _default = _cam_meta.get("default", {})
+                if "focal_px" in _default:
+                    _fx = _default["focal_px"]
+                    # Get image dimensions for cx, cy
+                    first_image = next(f for f in os.listdir(image_path) if f.lower().endswith(('.jpg', '.png', '.jpeg')))
+                    _w, _h = Image.open(os.path.join(image_path, first_image)).size
+                    _params = f"{_fx},{_fx},{_w/2.0},{_h/2.0},0,0,0,0"
+                    feature_extractor_cmd += ['--ImageReader.camera_params', _params]
+                    print(f"[FOCAL PRIOR] Single camera: fx={_fx:.1f}px")
         exhaustive_matcher_cmd = [
             'colmap', 'exhaustive_matcher',
             '--database_path', database_path,
@@ -67,6 +135,11 @@ def GenerateDatabase(image_path, database_path, feature_handler_name, config, si
             print(f"Feature extraction completed for {image_path}")
         except subprocess.CalledProcessError as e:
             print(f"Error during feature extraction: {e}")
+
+        # Patch database with per-camera focal priors (multi-camera only)
+        if camera_params_file and cameras and os.path.exists(camera_params_file):
+            _patch_database_focal_lengths(database_path, camera_params_file, cameras)
+
         try:
             subprocess.run(matcher_cmd, check=True, env=colmap_env)
             print(f"Exhaustive matching completed for {database_path}")

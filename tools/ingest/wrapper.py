@@ -31,6 +31,54 @@ import sys
 from pipeline_progress import progress, run_with_progress
 
 EVAL_MANIFEST = ".eval_frames.json"
+
+# Approximate smartphone sensor widths for focal length conversion
+SENSOR_WIDTHS_MM = {
+    # 1x main: ~26mm equiv → sensor ~6.86mm
+    # 0.5x ultrawide: ~13mm equiv → sensor ~4.25mm
+    # 2x telephoto: ~52mm equiv → sensor ~4.80mm
+    # 3x telephoto: ~77mm equiv → sensor ~3.50mm
+    "default": 6.17,  # generic smartphone 1/2.55" sensor
+}
+
+
+def focal_mm_to_px(focal_mm, image_width_px, sensor_width_mm=6.17):
+    """Convert focal length from mm to pixels given sensor width."""
+    return focal_mm * image_width_px / sensor_width_mm
+
+
+def extract_video_focal_metadata(video_path, image_width):
+    """Extract focal length in mm from video metadata using ffprobe.
+
+    Looks for Apple QuickTime camera focal length tag in format and stream tags.
+    Returns focal_mm float or None.
+    """
+    for show_entries in ["format_tags", "stream_tags"]:
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", show_entries,
+                 "-of", "json", video_path],
+                capture_output=True, text=True, timeout=10,
+            )
+            data = json.loads(result.stdout)
+            # Tags may be nested under "format" or "streams"
+            if show_entries == "format_tags":
+                tags = data.get("format", {}).get("tags", {})
+            else:
+                streams = data.get("streams", [])
+                tags = streams[0].get("tags", {}) if streams else {}
+
+            for key in ["com.apple.quicktime.camera.focal_length",
+                        "focal_length", "FocalLength"]:
+                if key in tags:
+                    val = tags[key]
+                    if "/" in str(val):
+                        num, den = str(val).split("/")
+                        return float(num) / float(den)
+                    return float(val)
+        except Exception:
+            continue
+    return None
 EXTRACTOR_SCRIPT = "/workspace/360Extractor/src/main.py"
 CAMERAS_PER_FRAME_360 = 16
 PERSON_CLASS_ID = 0  # COCO class 0 = person
@@ -527,6 +575,27 @@ def main():
                         json.dump(manifest, mf, indent=2)
                 print(f"[EVAL] Removed {_removed} eval tiles with persons, "
                       f"{len(_surviving)} remaining")
+
+    # ── Extract camera focal length metadata ────────────────
+    focal_mm = extract_video_focal_metadata(args.input, resolution)
+    if focal_mm is not None:
+        sensor_w = SENSOR_WIDTHS_MM["default"]
+        focal_px = focal_mm_to_px(focal_mm, resolution, sensor_w)
+        metadata = {
+            "cameras": {
+                "default": {
+                    "focal_mm": focal_mm,
+                    "sensor_width_mm": sensor_w,
+                    "focal_px": focal_px,
+                    "image_width_px": resolution,
+                    "source": "ffprobe"
+                }
+            }
+        }
+        meta_path = os.path.join(args.output, ".camera_metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"[METADATA] Saved focal length: {focal_mm}mm → {focal_px:.1f}px")
 
     progress("done", "completed", 100, step=1, total_steps=1)
 

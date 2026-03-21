@@ -771,11 +771,12 @@ def main():
         "--pipeline.model.difix3d-total-iters", str(args.iterations),
         "--pipeline.model.difix3d-tiles-per-frame", str(args.tiles_per_frame),
         "--pipeline.model.difix3d-eval-poses-path", str(eval_poses_path or ""),
+        # Disable progressive downscaling — train at full resolution from iter 0
+        "--pipeline.model.num-downscales", "0",
         "colmap",
         "--data", ws,
         "--images-path", "colmap/images",
         "--downscale-factor", str(args.resolution),
-        "--pipeline.model.num-downscales", "0",
     ]
 
     if has_masks:

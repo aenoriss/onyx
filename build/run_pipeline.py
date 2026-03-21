@@ -196,6 +196,29 @@ def check_image_exists(image):
     return result.returncode == 0
 
 
+def extract_focal_from_image(image_path):
+    """Extract focal length in mm from image EXIF using ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format_tags", "-of", "json", image_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        data = json.loads(result.stdout)
+        tags = data.get("format", {}).get("tags", {})
+        # Try common EXIF tag names
+        for key in ["FocalLength", "focal_length", "com.apple.quicktime.camera.focal_length"]:
+            if key in tags:
+                val = tags[key]
+                # Handle "4.2" or "4200/1000" format
+                if "/" in str(val):
+                    num, den = val.split("/")
+                    return float(num) / float(den)
+                return float(val)
+    except Exception:
+        pass
+    return None
+
+
 def get_required_containers(config=None):
     """Return the minimal set of containers needed for a given config."""
     if config is None:
@@ -852,6 +875,11 @@ def step_sfm(config, state, output_dir, dry_run=False):
 
     if config.get("cameras"):
         cmd.extend(["--cameras"] + config["cameras"])
+
+    # Pass camera focal length metadata if available
+    metadata_file = Path(output_dir) / ".camera_metadata.json"
+    if metadata_file.exists():
+        cmd.extend(["--camera-params-file", "/data/.camera_metadata.json"])
 
     run_docker(cmd, "SFM", state, output_dir, dry_run)
 
@@ -1675,6 +1703,9 @@ def parse_args():
                              "instead of the default gsplat. Enables mesh extraction.")
     parser.add_argument("--max-gs", type=int, default=1000000, dest="max_gs",
                         help="Maximum Gaussian count cap for gsplat MCMC (default: 1000000)")
+    parser.add_argument("--focal-lengths", default=None,
+                        help="Manual focal lengths in pixels, comma-separated per camera "
+                             "(e.g. --focal-lengths 1384,778)")
     return parser.parse_args()
 
 
@@ -1827,6 +1858,7 @@ def main():
             "cameras": args.cameras,
             "milo": args.milo,
             "max_gs": args.max_gs,
+            "focal_lengths": args.focal_lengths,
         }
         if args.interval:
             config["interval_override"] = args.interval
@@ -1859,7 +1891,42 @@ def main():
 
             # Write .video_type
             (output_dir / ".video_type").write_text(vtype, encoding="utf-8")
-        else:
+
+        # ── Write camera focal length metadata ───────────────
+        metadata_path = output_dir / ".camera_metadata.json"
+        if args.focal_lengths:
+            # Manual override
+            focals = [float(x) for x in args.focal_lengths.split(",")]
+            cam_names = args.cameras or ["default"]
+            cameras_meta = {}
+            for i, name in enumerate(cam_names):
+                fx = focals[i] if i < len(focals) else focals[0]
+                cameras_meta[name] = {"focal_px": fx, "source": "manual"}
+            with open(metadata_path, "w") as f:
+                json.dump({"cameras": cameras_meta}, f, indent=2)
+            print(f"[METADATA] Manual focal lengths: {cameras_meta}")
+        elif is_images_input and not metadata_path.exists():
+            # Try EXIF from first image per camera folder
+            cameras_meta = {}
+            img_dir = output_dir / "images"
+            if args.cameras:
+                for cam in args.cameras:
+                    cam_dir = img_dir / cam
+                    if cam_dir.is_dir():
+                        first_img = next(
+                            (f for f in sorted(cam_dir.iterdir())
+                             if f.suffix.lower() in {'.jpg', '.jpeg', '.png'}),
+                            None)
+                        if first_img:
+                            focal_mm = extract_focal_from_image(str(first_img))
+                            if focal_mm:
+                                cameras_meta[cam] = {"focal_mm": focal_mm, "source": "exif"}
+            if cameras_meta:
+                with open(metadata_path, "w") as f:
+                    json.dump({"cameras": cameras_meta}, f, indent=2)
+                print(f"[METADATA] Extracted EXIF focal lengths: {cameras_meta}")
+
+        if not is_images_input:
             # Symlink video into workdir
             video_dst = output_dir / "input_video.mp4"
             if not video_dst.exists():
