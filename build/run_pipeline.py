@@ -331,6 +331,7 @@ class PipelineState:
                 "colmap_mapper": config.get("colmap_mapper", False),
                 "cameras": config.get("cameras"),
                 "milo": config.get("milo", False),
+                "max_gs": config.get("max_gs"),
             },
             "started_at": datetime.now().isoformat(),
             "shared_steps": {
@@ -975,6 +976,9 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
     # DiFix3D+ inline fix cycles (interleaved during training)
     if config.get("difix3d", False):
         cmd.append("--difix3d")
+
+    if config.get("max_gs"):
+        cmd.extend(["--max-gs-num", str(config["max_gs"])])
 
     run_docker(cmd, "RECONSTRUCTION", state, output_dir, dry_run)
 
@@ -1667,6 +1671,8 @@ def parse_args():
     parser.add_argument("--milo", action="store_true",
                         help="Use MILo (mesh-in-the-loop) for gaussian/production "
                              "instead of the default gsplat. Enables mesh extraction.")
+    parser.add_argument("--max-gs", type=int, default=1000000, dest="max_gs",
+                        help="Maximum Gaussian count cap for gsplat MCMC (default: 1000000)")
     return parser.parse_args()
 
 
@@ -1818,6 +1824,7 @@ def main():
             "colmap_mapper": args.colmap_mapper,
             "cameras": args.cameras,
             "milo": args.milo,
+            "max_gs": args.max_gs,
         }
         if args.interval:
             config["interval_override"] = args.interval
