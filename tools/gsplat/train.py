@@ -751,7 +751,7 @@ def main():
         "--pipeline.model.cull-alpha-thresh", "0.005",
         # Per-image exposure/WB correction (off by default, causes shadow artifacts on ceilings)
         "--pipeline.model.use-bilateral-grid", str(args.bilateral_grid),
-        "--pipeline.model.antialiased", str(args.antialiased),
+        "--pipeline.model.rasterize-mode", "antialiased" if args.antialiased else "classic",
         # Gaussian cap — 500K with depth (MCMC never prunes, excess are dead weight
         # that inflate isect_tiles buffer → OOM spikes). 1M without depth.
         "--pipeline.model.max-gs-num", str(args.max_gs_num or 500000),
