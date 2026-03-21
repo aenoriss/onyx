@@ -620,6 +620,9 @@ def main():
                              "(replaces sparse points3D.bin)")
     parser.add_argument("--dense_init_pts", type=int, default=100_000,
                         help="Target point count when subsampling dense init cloud")
+    parser.add_argument("--antialiased", action="store_true",
+                        help="Enable Mip-Splatting anti-aliasing (adapts gaussian size to "
+                             "pixel footprint — reduces blur at distance, improves sharpness)")
     parser.add_argument("--bilateral-grid", action="store_true",
                         help="Enable bilateral grid for per-image exposure/WB correction "
                              "(useful for outdoor/360, causes shadow artifacts indoors)")
@@ -748,6 +751,7 @@ def main():
         "--pipeline.model.cull-alpha-thresh", "0.005",
         # Per-image exposure/WB correction (off by default, causes shadow artifacts on ceilings)
         "--pipeline.model.use-bilateral-grid", str(args.bilateral_grid),
+        "--pipeline.model.antialiased", str(args.antialiased),
         # Gaussian cap — 500K with depth (MCMC never prunes, excess are dead weight
         # that inflate isect_tiles buffer → OOM spikes). 1M without depth.
         "--pipeline.model.max-gs-num", str(args.max_gs_num or 500000),
