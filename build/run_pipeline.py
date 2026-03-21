@@ -958,20 +958,22 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
     ]
 
     if quality == "dense":
-        cmd.append("--mcmc")
+        cmd.extend(["--mcmc", "--antialiased"])
 
     if init_pcd:
-        dense_pts = "200000" if scene == "outdoor" else "100000"
+        dense_pts = "200000" if scene == "outdoor" else "200000"
         cmd.extend(["--init_pcd", init_pcd,
                     "--dense_init_pts", dense_pts])
 
-    if config.get("bilateral_grid", False):
+    # Auto-enable bilateral grid for multi-camera input (handles per-camera appearance variation)
+    multi_cam = len(config.get("cameras") or []) > 1
+    if config.get("bilateral_grid", False) or multi_cam:
         cmd.append("--bilateral-grid")
 
     # Depth supervision: explicit --depth flag, or auto-enabled for dense quality
     if config.get("depth", False) or quality == "dense":
         cmd.extend(["--depth", "--depth-weight",
-                     str(config.get("depth_weight", 0.2))])
+                     str(config.get("depth_weight", 0.05))])
 
     # DiFix3D+ inline fix cycles (interleaved during training)
     if config.get("difix3d", False):
@@ -1663,8 +1665,8 @@ def parse_args():
     parser.add_argument("--depth", action="store_true",
                         help="Enable depth supervision with Depth Anything V2 priors "
                              "(constrains Gaussians to surfaces)")
-    parser.add_argument("--depth-weight", type=float, default=0.2,
-                        help="Depth loss weight (default: 0.2)")
+    parser.add_argument("--depth-weight", type=float, default=0.05,
+                        help="Depth loss weight (default: 0.05)")
     parser.add_argument("--colmap-mapper", action="store_true",
                         help="Use COLMAP incremental mapper instead of InstantSfM "
                              "(better for cubemap/multi-camera data)")
