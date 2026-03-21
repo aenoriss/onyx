@@ -394,21 +394,28 @@ def main():
     # For 90° FOV tiles from equirectangular, optimal = src_width / 4.
     # Upsampling beyond source density creates fake blur via interpolation.
     resolution = args.resolution
-    if is_360 and resolution is None:
-        src_w, _ = get_video_dimensions(args.input)
-        if src_w:
-            # 90° FOV = 1/4 of 360° → max useful pixels = src_w / 4
-            native_res = src_w // 4
-            # Round down to nearest multiple of 64 for codec friendliness
-            native_res = (native_res // 64) * 64
-            resolution = native_res
-            print(f"[AUTO-RES] Source {src_w}px → tile {resolution}px "
-                  f"(native for 90° FOV, no upsampling)")
+    if resolution is None:
+        src_w, src_h = get_video_dimensions(args.input)
+        if is_360:
+            if src_w:
+                # 90° FOV = 1/4 of 360° → max useful pixels = src_w / 4
+                native_res = src_w // 4
+                # Round down to nearest multiple of 64 for codec friendliness
+                native_res = (native_res // 64) * 64
+                resolution = native_res
+                print(f"[AUTO-RES] Source {src_w}px → tile {resolution}px "
+                      f"(native for 90° FOV, no upsampling)")
+            else:
+                resolution = 2048
+                print(f"[AUTO-RES] Could not detect source resolution, using {resolution}px")
         else:
-            resolution = 2048
-            print(f"[AUTO-RES] Could not detect source resolution, using {resolution}px")
-    elif resolution is None:
-        resolution = 2048
+            if src_w:
+                # Standard mode: use native source width, no downscale
+                resolution = (src_w // 64) * 64
+                print(f"[AUTO-RES] Source {src_w}x{src_h}px → extracting at {resolution}px wide (native)")
+            else:
+                resolution = 0  # 0 = no resize in extractor
+                print(f"[AUTO-RES] Could not detect source resolution, extracting at native size")
 
     print(f"\n{'='*60}")
     print(f"Ingest: {mode} extraction")

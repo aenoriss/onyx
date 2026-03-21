@@ -39,7 +39,8 @@ RUN pip install --no-cache-dir plyfile
 # Create workspace
 WORKDIR /workspace
 
-# Copy training wrapper
+# Copy training scripts
 COPY train.py /workspace/train.py
+COPY generate_depths.py /workspace/generate_depths.py
 
 ENTRYPOINT ["python3", "/workspace/train.py"]

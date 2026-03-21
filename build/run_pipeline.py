@@ -970,8 +970,8 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
     if config.get("bilateral_grid", False) or multi_cam:
         cmd.append("--bilateral-grid")
 
-    # Depth supervision: explicit --depth flag, or auto-enabled for dense quality
-    if config.get("depth", False) or quality == "dense":
+    # Depth supervision: explicit --depth flag only (not auto-enabled for dense)
+    if config.get("depth", False):
         cmd.extend(["--depth", "--depth-weight",
                      str(config.get("depth_weight", 0.05))])
 

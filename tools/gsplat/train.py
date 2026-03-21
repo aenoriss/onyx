@@ -775,6 +775,7 @@ def main():
         "--data", ws,
         "--images-path", "colmap/images",
         "--downscale-factor", str(args.resolution),
+        "--pipeline.model.num-downscales", "0",
     ]
 
     if has_masks:
