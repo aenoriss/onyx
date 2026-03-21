@@ -877,9 +877,9 @@ def step_sfm(config, state, output_dir, dry_run=False):
         cmd.extend(["--cameras"] + config["cameras"])
 
     # Pass camera focal length metadata if available
-    metadata_file = Path(output_dir) / ".camera_metadata.json"
+    metadata_file = Path(output_dir) / "images" / ".camera_metadata.json"
     if metadata_file.exists():
-        cmd.extend(["--camera-params-file", "/data/.camera_metadata.json"])
+        cmd.extend(["--camera-params-file", "/data/images/.camera_metadata.json"])
 
     run_docker(cmd, "SFM", state, output_dir, dry_run)
 
@@ -1893,7 +1893,7 @@ def main():
             (output_dir / ".video_type").write_text(vtype, encoding="utf-8")
 
         # ── Write camera focal length metadata ───────────────
-        metadata_path = output_dir / ".camera_metadata.json"
+        metadata_path = output_dir / "images" / ".camera_metadata.json"
         if args.focal_lengths:
             # Manual override
             focals = [float(x) for x in args.focal_lengths.split(",")]
