@@ -40,7 +40,8 @@ RUN pip install --no-cache-dir plyfile
 WORKDIR /workspace
 
 # Copy training scripts
-COPY train.py /workspace/train.py
-COPY generate_depths.py /workspace/generate_depths.py
+COPY gsplat/train.py /workspace/train.py
+COPY gsplat/generate_depths.py /workspace/generate_depths.py
+COPY shared/pipeline_progress.py /workspace/pipeline_progress.py
 
 ENTRYPOINT ["python3", "/workspace/train.py"]
