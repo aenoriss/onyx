@@ -887,6 +887,24 @@ def step_sfm(config, state, output_dir, dry_run=False):
 def step_densification(config, state, output_dir, dry_run=False):
     """Step: OpenMVS dense point cloud (only for gaussian+dense)."""
     state.start_step("DENSIFICATION", "onyx-openmvs")
+
+    # Skip densification for 4K+ images with 600+ cameras — OOM on 32GB machines.
+    # COLMAP sparse points (typically 100-250K) are sufficient for gsplat init.
+    img_dir = output_dir / "images"
+    if img_dir.exists():
+        from PIL import Image as _Img
+        try:
+            first_img = next(f for f in img_dir.rglob("*") if f.suffix.lower() in {'.jpg', '.jpeg', '.png'})
+            _w, _h = _Img.open(first_img).size
+            n_images = sum(1 for f in img_dir.rglob("*") if f.suffix.lower() in {'.jpg', '.jpeg', '.png'})
+            if (_w >= 3840 or _h >= 2160) and n_images >= 600:
+                print(f"[SKIP] Densification — 4K+ images ({_w}x{_h}) with {n_images} cameras "
+                      f"exceeds 32GB RAM for OpenMVS fusion. Using COLMAP sparse init instead.")
+                state.complete_step("DENSIFICATION")
+                return
+        except (StopIteration, Exception):
+            pass
+
     _run_openmvs_densify(config, state, output_dir, dry_run)
 
 
@@ -987,7 +1005,7 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
         "--iterations", iterations,
     ]
 
-    if quality == "dense":
+    if quality in ("dense", "production"):
         cmd.extend(["--mcmc", "--antialiased"])
 
     if init_pcd:
@@ -995,9 +1013,10 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
         cmd.extend(["--init_pcd", init_pcd,
                     "--dense_init_pts", dense_pts])
 
-    # Auto-enable bilateral grid for multi-camera input (handles per-camera appearance variation)
+    # Auto-enable bilateral grid for production/dense quality or multi-camera input
+    # Handles per-image exposure/white balance variation (lighting changes, multi-cam color mismatch)
     multi_cam = len(config.get("cameras") or []) > 1
-    if config.get("bilateral_grid", False) or multi_cam:
+    if config.get("bilateral_grid", False) or multi_cam or quality in ("dense", "production"):
         cmd.append("--bilateral-grid")
 
     # Depth supervision: explicit --depth flag only (not auto-enabled for dense)

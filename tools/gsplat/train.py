@@ -755,8 +755,9 @@ def main():
         # Gaussian cap — 500K with depth (MCMC never prunes, excess are dead weight
         # that inflate isect_tiles buffer → OOM spikes). 1M without depth.
         "--pipeline.model.max-gs-num", str(args.max_gs_num or 500000),
-        # Learn pose corrections from SfM imprecision
-        "--pipeline.model.camera-optimizer.mode", "SO3xR3",
+        # Camera pose optimizer disabled — accurate COLMAP poses don't need correction.
+        # SO3xR3 causes blur with good poses (nerfstudio #1635, PostShot doesn't use it).
+        "--pipeline.model.camera-optimizer.mode", "off",
         # Depth supervision (Depth Anything V2 priors)
         # Uses native RGB+ED render (depth from same rasterization, zero extra VRAM)
         # Gradient freeze (DNGaussian) prevents depth from inflating scales

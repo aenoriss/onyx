@@ -97,11 +97,11 @@ def GenerateDatabase(image_path, database_path, feature_handler_name, config, si
             ]
         else:
             if cameras:
-                print(f"Normal video: per-folder cameras {cameras} with OPENCV (Brown-Conrady)")
+                print(f"Normal video: per-folder cameras {cameras} with SIMPLE_RADIAL")
             else:
-                print(f"Normal video: single camera with OPENCV (Brown-Conrady)")
+                print(f"Normal video: single camera with SIMPLE_RADIAL")
             feature_extractor_cmd += [
-                '--ImageReader.camera_model', 'OPENCV',
+                '--ImageReader.camera_model', 'SIMPLE_RADIAL',
             ]
             # Apply focal length prior for single camera (no --cameras)
             if camera_params_file and not cameras and os.path.exists(camera_params_file):
