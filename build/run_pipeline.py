@@ -1008,6 +1008,20 @@ def _run_gsplat(config, state, output_dir, dry_run, init_pcd=None):
     if quality in ("dense", "production"):
         cmd.extend(["--mcmc", "--antialiased"])
 
+    # Auto-downscale for 4K+ images to prevent CUDA OOM (24GB VRAM limit).
+    # Gaussians are 3D — training resolution doesn't affect PLY output quality.
+    img_dir = output_dir / "images"
+    if img_dir.exists():
+        try:
+            from PIL import Image as _Img
+            _first = next(f for f in img_dir.rglob("*") if f.suffix.lower() in {'.jpg', '.jpeg', '.png'})
+            _w, _h = _Img.open(_first).size
+            if _w >= 3840 or _h >= 2160:
+                cmd.extend(["--resolution", "2"])
+                print(f"[GSPLAT] 4K+ input ({_w}x{_h}) — training at half resolution to fit in VRAM")
+        except (StopIteration, Exception):
+            pass
+
     if init_pcd:
         dense_pts = "200000" if scene == "outdoor" else "200000"
         cmd.extend(["--init_pcd", init_pcd,
