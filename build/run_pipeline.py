@@ -908,12 +908,14 @@ def step_reconstruction(config, state, output_dir, dry_run=False):
     elif mode == "gaussian" and quality == "yono":
         _run_yonosplat(config, state, output_dir, dry_run)
     elif mode == "gaussian" and quality == "dense":
+        dense_ply = output_dir / "output" / "openmvs" / "scene_dense.ply"
+        init = "/data/output/openmvs/scene_dense.ply" if dense_ply.exists() else None
+        if not init:
+            print("[INFO] No dense PLY found — using COLMAP sparse points for init")
         if config.get("milo"):
-            _run_milo(config, state, output_dir, dry_run,
-                      init_pcd="/data/output/openmvs/scene_dense.ply")
+            _run_milo(config, state, output_dir, dry_run, init_pcd=init)
         else:
-            _run_gsplat(config, state, output_dir, dry_run,
-                        init_pcd="/data/output/openmvs/scene_dense.ply")
+            _run_gsplat(config, state, output_dir, dry_run, init_pcd=init)
     elif mode == "photogrammetry":
         _run_openmvs(config, state, output_dir, dry_run)
 

@@ -125,6 +125,17 @@ def main():
         "--input-file", str(ws / "scene.mvs"),
         "--output-file", str(ws / "scene_dense.mvs"),
     ]
+    # Auto-downscale depth maps for 4K+ images to prevent OOM (32GB RAM limit).
+    # Only affects MVS depth estimation — training images stay at full resolution.
+    try:
+        from PIL import Image as _Img
+        _first = next(f for f in Path(image_src).rglob("*") if f.suffix.lower() in {'.jpg','.jpeg','.png'})
+        _w, _h = _Img.open(_first).size
+        if _w >= 3840 or _h >= 2160:
+            densify_cmd.extend(["--resolution-level", "2"])
+            print(f"[DENSIFY] 4K+ input ({_w}x{_h}) — using --resolution-level 2 (quarter-res depth maps)")
+    except Exception:
+        pass
     if args.no_geom_consistency:
         densify_cmd.extend(["--geometric-iters", "0"])
     run_with_progress(
