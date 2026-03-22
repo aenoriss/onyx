@@ -1884,7 +1884,7 @@ def main():
             "is_images_input": is_images_input,
             "local": args.local,
             "segment": args.segment,
-            "mask_classes": args.mask_classes or ("person" if args.scene == "indoor" else None),
+            "mask_classes": args.mask_classes,
             "difix3d": args.difix3d,
             "bilateral_grid": args.bilateral_grid,
             "depth": args.depth,
