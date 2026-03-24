@@ -18,7 +18,7 @@ Usage:
         --input video.mp4 --output ./workdir \\
         --mode gaussian --scene outdoor --quality production --video normal
 
-    # New run from images directory (skips ingest)
+    # New run from images directory (runs ingest selection, skips extraction)
     python run_pipeline.py \\
         --input /path/to/photos/ --output ./workdir \\
         --mode gaussian --scene indoor --quality production
@@ -225,9 +225,7 @@ def get_required_containers(config=None):
         return ALL_CONTAINERS  # --install: check everything
     mode = config.get("mode", "gaussian")
     quality = config.get("quality", "production")
-    containers = ["onyx-instantsfm"]
-    if not config.get("is_images_input", False):
-        containers.append("onyx-ingest")
+    containers = ["onyx-instantsfm", "onyx-ingest"]
     recon = RECONSTRUCTION_CONTAINER.get((mode, quality))
     if recon:
         # --milo flag overrides default gsplat for production/dense
@@ -749,12 +747,13 @@ def run_docker(cmd, step_name, state, output_dir, dry_run=False):
 # ─── Pipeline Steps ──────────────────────────────────────────
 
 def step_ingest(config, state, output_dir, dry_run=False):
-    """Step 1: Extract frames from video.
+    """Step 1: Extract frames from video (or select images from folder).
 
     The ingest wrapper handles:
     - 360 auto-detection (from metadata + aspect ratio)
     - Interval calculation (from target image count + video duration)
     - Writes .video_type file for orchestrator to read back
+    - For image folder input: skips extraction, runs scoring/selection only
     """
     container = "onyx-ingest"
     state.start_step("INGEST", container)
@@ -763,27 +762,47 @@ def step_ingest(config, state, output_dir, dry_run=False):
         (config["scene"], config["quality"]), 300
     )
 
-    # Resolve the real video path. input_video.mp4 in output_dir is an absolute
-    # symlink that breaks inside the container (target path not in mount ns).
-    # Mount the actual file at a separate /video/ path to avoid colliding with
-    # the existing symlink already present under /data.
-    real_video = Path(config["input"]).resolve()
+    is_images = config.get("is_images_input", False)
 
-    cmd = [
-        "docker", "run", "--rm", "--gpus", "all",
-        *uid_gid_flags(),
-        "-v", f"{docker_path(output_dir)}:/data",
-        "-v", f"{docker_path(real_video)}:/video/input.mp4:ro",
-        image_name(config.get("local", False), container),
-        "--input", "/video/input.mp4",
-        "--output", "/data/images",
-        "--target-images", str(target),
-        "--video-type", config.get("video", "normal"),
-    ]
+    if is_images:
+        # Image folder input: run selection pipeline only (no video extraction)
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            *uid_gid_flags(),
+            "-v", f"{docker_path(output_dir)}:/data",
+            image_name(config.get("local", False), container),
+            "--input", "/data/images",  # dummy, not used for extraction
+            "--output", "/data/images",
+            "--target-images", str(target),
+            "--images-input",
+            "--video-type", config.get("video", "normal"),
+        ]
+        # Pass camera subfolders for multi-camera input
+        if config.get("cameras"):
+            cmd.extend(["--cameras"] + config["cameras"])
+    else:
+        # Video input: full extraction + selection pipeline
+        # Resolve the real video path. input_video.mp4 in output_dir is an absolute
+        # symlink that breaks inside the container (target path not in mount ns).
+        # Mount the actual file at a separate /video/ path to avoid colliding with
+        # the existing symlink already present under /data.
+        real_video = Path(config["input"]).resolve()
 
-    # Pass through interval override if user specified one
-    if config.get("interval_override"):
-        cmd.extend(["--interval", str(config["interval_override"])])
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            *uid_gid_flags(),
+            "-v", f"{docker_path(output_dir)}:/data",
+            "-v", f"{docker_path(real_video)}:/video/input.mp4:ro",
+            image_name(config.get("local", False), container),
+            "--input", "/video/input.mp4",
+            "--output", "/data/images",
+            "--target-images", str(target),
+            "--video-type", config.get("video", "normal"),
+        ]
+
+        # Pass through interval override if user specified one
+        if config.get("interval_override"):
+            cmd.extend(["--interval", str(config["interval_override"])])
 
     run_docker(cmd, "INGEST", state, output_dir, dry_run)
 
@@ -887,24 +906,6 @@ def step_sfm(config, state, output_dir, dry_run=False):
 def step_densification(config, state, output_dir, dry_run=False):
     """Step: OpenMVS dense point cloud (only for gaussian+dense)."""
     state.start_step("DENSIFICATION", "onyx-openmvs")
-
-    # Skip densification for 4K+ images with 600+ cameras — OOM on 32GB machines.
-    # COLMAP sparse points (typically 100-250K) are sufficient for gsplat init.
-    img_dir = output_dir / "images"
-    if img_dir.exists():
-        from PIL import Image as _Img
-        try:
-            first_img = next(f for f in img_dir.rglob("*") if f.suffix.lower() in {'.jpg', '.jpeg', '.png'})
-            _w, _h = _Img.open(first_img).size
-            n_images = sum(1 for f in img_dir.rglob("*") if f.suffix.lower() in {'.jpg', '.jpeg', '.png'})
-            if (_w >= 3840 or _h >= 2160) and n_images >= 600:
-                print(f"[SKIP] Densification — 4K+ images ({_w}x{_h}) with {n_images} cameras "
-                      f"exceeds 32GB RAM for OpenMVS fusion. Using COLMAP sparse init instead.")
-                state.complete_step("DENSIFICATION")
-                return
-        except (StopIteration, Exception):
-            pass
-
     _run_openmvs_densify(config, state, output_dir, dry_run)
 
 
@@ -1979,9 +1980,6 @@ def main():
         print(f"Output: {output_dir}")
 
     # ── Apply skip shortcuts ──────────────────────────────────
-    if config.get("is_images_input"):
-        if state.step_status("INGEST") != "completed":
-            state.skip_step("INGEST", f"images directory input")
     if args.skip_ingest:
         if state.step_status("INGEST") != "completed":
             state.skip_step("INGEST", "user requested --skip-ingest")

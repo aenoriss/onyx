@@ -120,22 +120,48 @@ def main():
             f"{m.group(1)}%",
         ),
     }
-    densify_cmd = [
-        "DensifyPointCloud",
-        "--input-file", str(ws / "scene.mvs"),
-        "--output-file", str(ws / "scene_dense.mvs"),
-    ]
-    # Auto-downscale depth maps for 4K+ images to prevent OOM (32GB RAM limit).
-    # Only affects MVS depth estimation — training images stay at full resolution.
+    # Auto-downscale images to 2K for densification if 4K+ (prevents OOM on 32GB).
+    # Original 4K images are preserved for TextureMesh (high-res textures).
+    image_src_4k = None  # set if we downscaled, for TextureMesh to use originals
     try:
         from PIL import Image as _Img
         _first = next(f for f in Path(image_src).rglob("*") if f.suffix.lower() in {'.jpg','.jpeg','.png'})
         _w, _h = _Img.open(_first).size
         if _w >= 3840 or _h >= 2160:
-            densify_cmd.extend(["--resolution-level", "2"])
-            print(f"[DENSIFY] 4K+ input ({_w}x{_h}) — using --resolution-level 2 (quarter-res depth maps)")
-    except Exception:
-        pass
+            image_src_4k = image_src  # save original path for texturing
+            image_src_2k = Path(WORKSPACE) / "images_2k"
+            image_src_2k.mkdir(parents=True, exist_ok=True)
+            scale = 2048.0 / _w
+            new_h = int(_h * scale)
+            print(f"[DENSIFY] 4K+ input ({_w}x{_h}) — downscaling to 2K ({2048}x{new_h}) for densification")
+            for img_path in sorted(Path(image_src).rglob("*")):
+                if img_path.suffix.lower() in {'.jpg', '.jpeg', '.png'}:
+                    img = _Img.open(img_path)
+                    img_resized = img.resize((2048, new_h), _Img.LANCZOS)
+                    dst = image_src_2k / img_path.relative_to(image_src)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    img_resized.save(str(dst), quality=95)
+            # Re-run InterfaceCOLMAP with 2K images so depth maps match
+            print("[DENSIFY] Re-running InterfaceCOLMAP with 2K images...")
+            run_with_progress(
+                ["InterfaceCOLMAP",
+                 "--input-file", str(ws),
+                 "--image-folder", str(image_src_2k),
+                 "--output-file", str(ws / "scene.mvs")],
+                stage="interface_colmap_2k",
+                step=2, total_steps=TOTAL_STEPS,
+            )
+            image_src = image_src_2k
+    except (StopIteration, Exception) as e:
+        if image_src_4k:
+            print(f"[DENSIFY] Warning: 2K downscale failed ({e}), using original images")
+            image_src_4k = None
+
+    densify_cmd = [
+        "DensifyPointCloud",
+        "--input-file", str(ws / "scene.mvs"),
+        "--output-file", str(ws / "scene_dense.mvs"),
+    ]
     if args.no_geom_consistency:
         densify_cmd.extend(["--geometric-iters", "0"])
     run_with_progress(
@@ -174,6 +200,19 @@ def main():
 
         # ── Step 4: TextureMesh ───────────────────────────────────
         # Note: --export-type obj segfaults on v2.3.0, use default MVS+PLY
+        # If we downscaled for densification, re-run InterfaceCOLMAP with
+        # original 4K images for high-res textures.
+        if image_src_4k:
+            print(f"[TEXTURE] Switching to original 4K images for high-res textures")
+            run_with_progress(
+                ["InterfaceCOLMAP",
+                 "--input-file", str(ws),
+                 "--image-folder", str(image_src_4k),
+                 "--output-file", str(ws / "scene.mvs")],
+                stage="interface_colmap_4k",
+                step=4, total_steps=TOTAL_STEPS,
+            )
+
         texture_patterns = {
             r"(?i)(?:view|patch|atlas).{1,30}?(\d+)/(\d+)": lambda m: (
                 round(int(m.group(1)) / int(m.group(2)) * 100),

@@ -381,7 +381,78 @@ def main():
                         help="JPEG quality (default: 95)")
     parser.add_argument("--holdout", action="store_true",
                         help="Select eval holdout frames from discards for quality metrics")
+    parser.add_argument("--images-input", action="store_true",
+                        help="Input is a folder of images (skip video extraction, run selection only)")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera subfolder names for multi-camera image input (e.g. ultra wide)")
     args = parser.parse_args()
+
+    # ── Images-input mode: skip extraction, run selection only ──
+    if args.images_input:
+        is_360 = (args.video_type == "360")
+        total_steps = 3 if is_360 else 2  # person_filter + score + select (or score + select)
+        step_num = 0
+
+        # Step: Person filtering (360 only — remove tiles dominated by people)
+        if is_360:
+            step_num += 1
+            progress("person_filter", "running", 0, step=step_num, total_steps=total_steps)
+            print("[IMAGES] Running person filter (360 mode)...")
+            _filter_person_tiles(args.output)
+
+        # Step: Score images
+        step_num += 1
+        progress("selecting_images", "running", 0, step=step_num, total_steps=total_steps)
+
+        if not args.target_images:
+            print("[IMAGES] No --target-images specified, keeping all images")
+            progress("done", "completed", 100, step=step_num, total_steps=total_steps)
+            sys.exit(0)
+
+        from frame_selector import score_images, select_and_prune
+
+        print(f"[IMAGES] Scoring images in {args.output} ({'360' if is_360 else 'normal'} mode)...")
+        scores = score_images(args.output, cameras=args.cameras)
+
+        if not scores:
+            print("[IMAGES] No images found to score")
+            progress("done", "completed", 100, step=step_num, total_steps=total_steps)
+            sys.exit(0)
+
+        n_images = len(scores)
+        # For 360, target_images includes all tiles (16 per frame)
+        effective_target = args.target_images
+        if n_images <= effective_target:
+            print(f"[IMAGES] {n_images} images <= target {effective_target}, keeping all")
+            progress("done", "completed", 100, step=step_num, total_steps=total_steps)
+            sys.exit(0)
+
+        # Step: Select best frames
+        step_num += 1
+        progress("pruning_images", "running", 0, step=step_num, total_steps=total_steps)
+        print(f"[IMAGES] Selecting best {effective_target} from {n_images} images...")
+
+        # Compute adaptive max_gap based on budget
+        n_cameras = len(set(s.camera for s in scores))
+        n_frames = len(set(s.frame_idx for s in scores))
+        target_frames = max(1, effective_target // max(n_cameras, 1))
+        budget_gap = max(8, n_frames // target_frames) if target_frames > 0 else 8
+
+        to_delete = select_and_prune(scores, target_count=effective_target,
+                                     max_gap=budget_gap)
+
+        # Delete rejected images
+        n_deleted = 0
+        for path in to_delete:
+            os.remove(path)
+            n_deleted += 1
+
+        remaining = len(scores) - n_deleted
+        print(f"[IMAGES] Kept {remaining}, deleted {n_deleted} "
+              f"(target was {effective_target}, mode={'360' if is_360 else 'normal'})")
+
+        progress("done", "completed", 100, step=step_num, total_steps=total_steps)
+        sys.exit(0)
 
     progress("detecting_video", "running", 0, step=1, total_steps=1)
 

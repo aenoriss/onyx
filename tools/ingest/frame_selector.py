@@ -25,6 +25,8 @@ OVERLAP_RESOLUTION = 256  # downscale for overlap matching (speed)
 
 # Pattern: {video}_frame{XXXXXX}_{camera}.jpg
 TILE_PATTERN = re.compile(r".*_frame(\d+)_(.+)\.(jpg|png)$", re.IGNORECASE)
+# Generic image extensions for non-tile (photo folder) input
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
 
 # FLANN matcher params for SIFT
 FLANN_INDEX_KDTREE = 1
@@ -92,6 +94,100 @@ def score_tiles(image_dir: str) -> list[TileScore]:
     n_frames = len(set(s.frame_idx for s in scores))
     n_cameras = len(set(s.camera for s in scores))
     print(f"[SCORE] Done in {elapsed:.1f}s — {len(scores)} tiles, "
+          f"{n_frames} frames, {n_cameras} cameras")
+    if scores:
+        sift_counts = [s.sift_count for s in scores]
+        print(f"[SCORE] SIFT: {min(sift_counts)}-{max(sift_counts)} "
+              f"(mean {sum(sift_counts)/len(sift_counts):.0f})")
+
+    return scores
+
+
+def score_images(image_dir: str, cameras: list[str] | None = None) -> list[TileScore]:
+    """Score generic images (photo folder input) with SIFT + sharpness.
+
+    Unlike score_tiles() which expects video-extracted tile filenames,
+    this handles arbitrary image filenames. Each image becomes its own
+    "frame" (frame_idx assigned by sort order). For multi-camera input,
+    images in each camera subfolder share the same frame_idx by sort position.
+
+    Args:
+        image_dir: Directory containing images (or camera subfolders).
+        cameras: List of camera subfolder names (e.g. ["ultra", "wide"]).
+                 If None, treats all images in image_dir as single-camera.
+    """
+    sift = cv2.SIFT_create()
+    scores = []
+
+    if cameras:
+        # Multi-camera: pair images across subfolders by sort position
+        cam_files: dict[str, list[str]] = {}
+        for cam in cameras:
+            cam_dir = os.path.join(image_dir, cam)
+            if not os.path.isdir(cam_dir):
+                print(f"[SCORE] Warning: camera folder {cam} not found, skipping")
+                continue
+            cam_files[cam] = sorted([
+                f for f in os.listdir(cam_dir)
+                if os.path.splitext(f)[1].lower() in IMAGE_EXTS
+            ])
+
+        # Build list: (frame_idx, camera, filepath)
+        file_list = []
+        for cam, files in cam_files.items():
+            for idx, fname in enumerate(files):
+                filepath = os.path.join(image_dir, cam, fname)
+                file_list.append((idx, cam, filepath, fname))
+    else:
+        # Single camera: each image is its own frame
+        files = sorted([
+            f for f in os.listdir(image_dir)
+            if os.path.isfile(os.path.join(image_dir, f))
+            and os.path.splitext(f)[1].lower() in IMAGE_EXTS
+        ])
+        file_list = [(idx, "default", os.path.join(image_dir, f), f)
+                     for idx, f in enumerate(files)]
+
+    total = len(file_list)
+    if total == 0:
+        print("[SCORE] No images found to score")
+        return []
+
+    print(f"[SCORE] Scoring {total} images at {SCORE_RESOLUTION}px...")
+    t0 = time.time()
+
+    for i, (frame_idx, camera, filepath, fname) in enumerate(file_list):
+        img = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+
+        h, w = img.shape[:2]
+        if max(h, w) > SCORE_RESOLUTION:
+            scale = SCORE_RESOLUTION / max(h, w)
+            img = cv2.resize(img, (int(w * scale), int(h * scale)))
+
+        keypoints = sift.detect(img, None)
+        sift_count = len(keypoints)
+        sharpness = cv2.Laplacian(img, cv2.CV_64F).var()
+
+        scores.append(TileScore(
+            path=filepath,
+            filename=fname,
+            frame_idx=frame_idx,
+            camera=camera,
+            sift_count=sift_count,
+            sharpness=sharpness,
+        ))
+
+        if (i + 1) % 200 == 0 or (i + 1) == total:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            print(f"[SCORE] {i+1}/{total} ({rate:.0f} images/s)")
+
+    elapsed = time.time() - t0
+    n_frames = len(set(s.frame_idx for s in scores))
+    n_cameras = len(set(s.camera for s in scores))
+    print(f"[SCORE] Done in {elapsed:.1f}s — {len(scores)} images, "
           f"{n_frames} frames, {n_cameras} cameras")
     if scores:
         sift_counts = [s.sift_count for s in scores]
